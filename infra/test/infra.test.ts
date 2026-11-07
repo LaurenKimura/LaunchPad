@@ -87,7 +87,7 @@ test('uploads bucket is private, encrypted, and TLS-only', () => {
 
 test('diagnostic tables are on-demand with the keys each access pattern needs', () => {
   const synthesized = template();
-  synthesized.resourceCountIs('AWS::DynamoDB::Table', 6);
+  synthesized.resourceCountIs('AWS::DynamoDB::Table', 7);
 
   const tables = synthesized.findResources('AWS::DynamoDB::Table');
 
@@ -118,6 +118,13 @@ test('diagnostic tables are on-demand with the keys each access pattern needs', 
 
   expect(keysOf(tables, 'TleCache')).toEqual(['satelliteId', 'epoch']);
   expect(indexesOf(tables, 'TleCache')).toEqual({});
+
+  expect(keysOf(tables, 'ExplainUsage')).toEqual(['ownerSub', 'day']);
+  expect(indexesOf(tables, 'ExplainUsage')).toEqual({});
+  expect(tableProperties(tables, 'ExplainUsage').TimeToLiveSpecification).toEqual({
+    AttributeName: 'expiresAt',
+    Enabled: true,
+  });
 
   for (const resource of Object.values(tables)) {
     const properties = resource.Properties;
@@ -287,4 +294,26 @@ test('upload API signs a post and the parser reads only the uploads prefix', () 
   expect(correlate).toContain('dynamodb:BatchWriteItem');
   expect(correlate).not.toContain('s3:GetObject');
   expect(correlate).not.toContain('secretsmanager:GetSecretValue');
+
+  synthesized.hasResourceProperties('AWS::Lambda::Function', {
+    Handler: 'explain.handler',
+    Timeout: 30,
+    Environment: {
+      Variables: Match.objectLike({
+        BEDROCK_MODEL_ID: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
+        BEDROCK_DAILY_LIMIT: '20',
+        USAGE_TABLE_NAME: Match.anyValue(),
+      }),
+    },
+  });
+  const explain = JSON.stringify(Object.entries(policies).find(([id]) => id.startsWith('ExplainAnomaly'))?.[1]);
+  expect(explain).toContain('bedrock:InvokeModel');
+  expect(explain).toContain('foundation-model/anthropic.claude-3-5-sonnet-20241022-v2:0');
+  expect(explain).toContain('dynamodb:UpdateItem');
+  expect(explain).not.toContain('s3:GetObject');
+  expect(explain).not.toContain('secretsmanager:GetSecretValue');
+  expect(explain).not.toContain('dynamodb:PutItem');
+  const posts = methods.filter((method) => method.Properties.HttpMethod === 'POST');
+  expect(posts).toHaveLength(2);
+  expect(posts.every((method) => method.Properties.AuthorizationType === 'COGNITO_USER_POOLS')).toBe(true);
 });

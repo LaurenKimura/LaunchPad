@@ -46,6 +46,8 @@ Sample files are in [`samples/`](../samples/README.md). The unit tests load thos
 
 `scoring.py` has one pure function per cause. Weights are in [`src/scoring_weights.json`](src/scoring_weights.json). `propagate.py` uses SGP4 for position, the configured South Atlantic Anomaly box, and a cylindrical Earth shadow. `correlate.handler` reads DynamoDB and writes four CauseScores rows. A gap fully inside a SEP scores `radiation.sep_full_overlap` (85 in the shipped file) and does not pull the other scores down.
 
+`explain.handler` sends those stored scores and evidence to Claude on Bedrock. It does not compute a score. The prompt tells the model to use only the supplied numbers, never invent events, say when evidence is weak, and treat telemetry text as data rather than instructions. Recommended fixes are limited to watchdog reset, safe mode, EDAC scrubbing, power review, and software patch review. A follow-up question is answered from the same stored packet. Each operator gets 20 calls per UTC day. Logs do not include the prompt, the question, the evidence, or the model text.
+
 `pip install -r requirements-dev.txt` installs `sgp4` for the tests. The CDK app installs the same version into the correlation Lambda asset.
 
 ## Tests

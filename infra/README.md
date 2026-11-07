@@ -9,13 +9,14 @@ This stack creates:
 - A private S3 bucket for telemetry uploads, encrypted with an S3-managed key
 - A second private bucket for raw responses from NASA DONKI, NOAA SWPC, and CelesTrak
 - Six on-demand DynamoDB tables for satellites, uploads, anomalies, cause scores, space-weather samples, and cached TLEs
+- An ExplainUsage table that counts Bedrock calls per operator per UTC day
 - A Secrets Manager secret for the NASA API key
 - An hourly Lambda, started by EventBridge, that archives those responses and writes normalized rows
 - `POST /uploads` on API Gateway. A signed-in operator receives a presigned POST for one CSV or JSON file
 - A parser Lambda, started by the S3 object-created event, that records gap windows on the Anomalies table
 - A correlation Lambda that scores each window. The four scores are independent 0–100 values
 
-Bedrock is not in this stack. The fetch Lambda cannot read the telemetry bucket. The correlation Lambda cannot read the uploads bucket.
+`POST /anomalies/{anomalyId}/explain` sends the stored scores and evidence to Claude on Bedrock. The model does not compute scores. Each operator gets 20 calls per UTC day. The fetch Lambda cannot read the telemetry bucket. The correlation Lambda cannot read the uploads bucket. The explain Lambda cannot read S3.
 
 Account and region come from your AWS CLI configuration. No account id, region, or secret is stored in the repo.
 
@@ -184,6 +185,8 @@ Every route requires a Cognito ID token in the `Authorization` header. A missing
 | `POST` | `/uploads` | A presigned POST for one CSV or JSON file |
 
 The read role can query Satellites (`byOwner` and get-by-id), Anomalies (`bySatellite`, `byAnomalyId`), CauseScores, SpaceWeatherEvents, and TLECache. It cannot write those tables or read S3. The timeline uses the same DONKI association windows as scoring. Eclipse bars come from SGP4 over the gap. The latest Kp is the newest `noaa_kp` row at or before the request. The same response includes the TLE in effect at the gap start and the South Atlantic Anomaly box from the scoring weights, so the globe can draw the orbit. The TLE lines are not written to the logs.
+
+`POST /anomalies/{anomalyId}/explain` is the same Cognito authorizer. An empty body asks for a summary and recommended fixes. A JSON body `{"question":"..."}` answers a follow-up from that anomaly's stored scores, evidence, and timeline. The question is limited to 500 characters. The explain role can read the anomaly, its scores, space weather, and the TLE cache, and it can update only the caller's ExplainUsage counter. It can call `bedrock:InvokeModel` for the configured Claude model and nothing else. TLE lines are not sent to the model and are not logged. The prompt, the evidence, the question, and the model text are not logged. The default model id is `anthropic.claude-3-5-sonnet-20241022-v2:0` (`BEDROCK_MODEL_ID`). The daily limit is 20 (`BEDROCK_DAILY_LIMIT`).
 
 ## Telemetry upload
 

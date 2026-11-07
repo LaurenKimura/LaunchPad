@@ -2,11 +2,11 @@
 
 Satellite anomaly diagnostic dashboard. An operator uploads a telemetry file with gaps or errors. The app correlates each gap with space weather, orbital position (South Atlantic Anomaly and Earth-shadow eclipse), and software-fault patterns, then shows an independent likelihood and a plain-English fix for each cause.
 
-Scores are estimates from 0 to 100. Each cause stands on its own: the numbers are not forced to sum to 100. Python computes every score. Bedrock, when it is added, only explains numbers it is given.
+Scores are estimates from 0 to 100. Each cause stands on its own: the numbers are not forced to sum to 100. Python computes every score. Bedrock only explains numbers it is given.
 
 An hourly Lambda in [`backend/`](backend/README.md) fetches NASA DONKI, NOAA SWPC, and CelesTrak. It stores raw responses in a private S3 bucket and normalized rows in DynamoDB. The NASA key lives in Secrets Manager.
 
-The web app in [`frontend/`](frontend/README.md) signs operators in with Cognito, lists their satellites and recent gaps, and uploads one telemetry file. `GET /satellites`, `GET /anomalies`, and `GET /anomalies/{anomalyId}` are Cognito-protected. A signed-in operator calls `POST /uploads` and receives a presigned POST. The file is limited to 5 MiB. After it lands, a parser converts timestamps to UTC and records each gap longer than twice the median sampling interval. A correlation Lambda then writes four independent 0–100 scores for radiation, eclipse, geomagnetic activity, and repeating software patterns. Example files are in [`samples/`](samples/README.md). The score weights are in [`backend/src/scoring_weights.json`](backend/src/scoring_weights.json). The estimate disclaimer stays in the app layout.
+The web app in [`frontend/`](frontend/README.md) signs operators in with Cognito, lists their satellites and recent gaps, and uploads one telemetry file. `GET /satellites`, `GET /anomalies`, and `GET /anomalies/{anomalyId}` are Cognito-protected. A signed-in operator calls `POST /uploads` and receives a presigned POST. The file is limited to 5 MiB. After it lands, a parser converts timestamps to UTC and records each gap longer than twice the median sampling interval. A correlation Lambda then writes four independent 0–100 scores for radiation, eclipse, geomagnetic activity, and repeating software patterns. Example files are in [`samples/`](samples/README.md). The score weights are in [`backend/src/scoring_weights.json`](backend/src/scoring_weights.json). On an anomaly, Claude can summarize the stored scores and answer a follow-up from that same stored data. Each operator gets 20 of those calls per UTC day. The estimate disclaimer stays in the app layout.
 
 ## Deploy
 

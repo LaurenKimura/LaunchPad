@@ -20,7 +20,8 @@ import { Construct } from 'constructs';
  * Operators sign in with email. Telemetry files land in a private encrypted
  * bucket. An hourly Lambda archives public space-weather and TLE responses.
  * Operators request a presigned upload, and a parser records gap windows.
- * A correlation Lambda scores each window. Bedrock is not part of this stack.
+ * A correlation Lambda scores each window. A separate Lambda asks Claude
+ * on Bedrock to explain those stored scores. Claude does not compute them.
  */
 export class LaunchpadStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -35,6 +36,7 @@ export class LaunchpadStack extends cdk.Stack {
     const causeScores = this.causeScoresTable();
     const spaceWeather = this.spaceWeatherTable();
     const tleCache = this.tleCacheTable();
+    const explainUsage = this.explainUsageTable();
     const rawResponses = this.rawResponsesBucket();
     const nasaSecret = this.nasaSecret();
     this.hourlyExternalFetch({ rawResponses, nasaSecret, satellites, spaceWeather, tleCache });
@@ -47,6 +49,7 @@ export class LaunchpadStack extends cdk.Stack {
       causeScores,
       spaceWeather,
       tleCache,
+      explainUsage,
     });
 
     new cdk.CfnOutput(this, 'UserPoolId', {
@@ -269,6 +272,24 @@ export class LaunchpadStack extends cdk.Stack {
   }
 
   /**
+   * One counter per operator per UTC day. The explain Lambda adds a call
+   * only while the count is under the daily limit. Items expire on their own.
+   */
+  private explainUsageTable(): dynamodb.Table {
+    return new dynamodb.Table(this, 'ExplainUsage', {
+      partitionKey: stringAttr('ownerSub'),
+      sortKey: stringAttr('day'),
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      encryption: dynamodb.TableEncryption.AWS_MANAGED,
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      timeToLiveAttribute: 'expiresAt',
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+  }
+
+  /**
    * Raw public API bodies. Separate from the telemetry bucket so this data
    * and operator uploads are not mixed, and so the fetch role never receives
    * permission to read uploads. `raw/` expires after 30 days. `cache/` stays.
@@ -382,6 +403,7 @@ export class LaunchpadStack extends cdk.Stack {
     causeScores: dynamodb.Table;
     spaceWeather: dynamodb.Table;
     tleCache: dynamodb.Table;
+    explainUsage: dynamodb.Table;
   }): apigateway.RestApi {
     const backendSrc = path.resolve(__dirname, '../../backend/src');
     const code = lambda.Code.fromAsset(backendSrc, {
@@ -558,11 +580,66 @@ export class LaunchpadStack extends cdk.Stack {
       authorizer,
       authorizationType: apigateway.AuthorizationType.COGNITO,
     };
+    const modelId = 'anthropic.claude-3-5-sonnet-20241022-v2:0';
+    const explainFn = new lambda.Function(this, 'ExplainAnomaly', {
+      description: 'Asks Claude to explain stored anomaly scores. It does not compute scores.',
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'explain.handler',
+      code: scoredCode,
+      timeout: cdk.Duration.seconds(30),
+      memorySize: 512,
+      logGroup: new logs.LogGroup(this, 'ExplainAnomalyLogs', {
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+      environment: {
+        SATELLITES_TABLE_NAME: resources.satellites.tableName,
+        ANOMALIES_TABLE_NAME: resources.anomalies.tableName,
+        CAUSE_SCORES_TABLE_NAME: resources.causeScores.tableName,
+        SPACE_WEATHER_TABLE_NAME: resources.spaceWeather.tableName,
+        TLE_TABLE_NAME: resources.tleCache.tableName,
+        USAGE_TABLE_NAME: resources.explainUsage.tableName,
+        BEDROCK_MODEL_ID: modelId,
+        BEDROCK_DAILY_LIMIT: '20',
+      },
+    });
+    explainFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadOwnedAnomaly',
+      actions: ['dynamodb:GetItem'],
+      resources: [resources.satellites.tableArn],
+    }));
+    explainFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadAnomalyContext',
+      actions: ['dynamodb:Query'],
+      resources: [
+        `${resources.anomalies.tableArn}/index/byAnomalyId`,
+        resources.causeScores.tableArn,
+        resources.spaceWeather.tableArn,
+        resources.tleCache.tableArn,
+      ],
+    }));
+    explainFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'CountDailyExplanations',
+      actions: ['dynamodb:UpdateItem'],
+      resources: [resources.explainUsage.tableArn],
+    }));
+    explainFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'InvokeClaude',
+      actions: ['bedrock:InvokeModel'],
+      resources: [`arn:aws:bedrock:${this.region}::foundation-model/${modelId}`],
+    }));
+
     const readIntegration = new apigateway.LambdaIntegration(readFn, { proxy: true });
     api.root.addResource('satellites').addMethod('GET', readIntegration, authorized);
     const anomalies = api.root.addResource('anomalies');
     anomalies.addMethod('GET', readIntegration, authorized);
-    anomalies.addResource('{anomalyId}').addMethod('GET', readIntegration, authorized);
+    const anomaly = anomalies.addResource('{anomalyId}');
+    anomaly.addMethod('GET', readIntegration, authorized);
+    anomaly.addResource('explain').addMethod(
+      'POST',
+      new apigateway.LambdaIntegration(explainFn, { proxy: true }),
+      authorized,
+    );
     api.root.addResource('uploads').addMethod(
       'POST',
       new apigateway.LambdaIntegration(presignFn, { proxy: true }),

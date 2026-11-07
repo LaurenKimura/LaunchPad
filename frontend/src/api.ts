@@ -1,5 +1,5 @@
 import { appConfig } from "./config";
-import type { Anomaly, AnomalyDetail, Presign, Satellite } from "./types";
+import type { Anomaly, AnomalyDetail, Explanation, Presign, Satellite } from "./types";
 import { contentTypeFor } from "./uploadRules";
 
 const ERROR_TEXT: Record<string, string> = {
@@ -10,6 +10,12 @@ const ERROR_TEXT: Record<string, string> = {
   invalid_satellite: "Choose a satellite.",
   invalid_anomaly: "That anomaly id is not valid.",
   invalid_limit: "Choose a smaller page size.",
+  invalid_body: "The explanation request was not valid.",
+  invalid_question: "Enter a question.",
+  question_too_long: "Shorten the question to 500 characters.",
+  no_scores: "This anomaly has no stored scores to explain.",
+  daily_limit: "The daily explanation limit for this account has been reached.",
+  explanation_unavailable: "The explanation service is unavailable. Try again shortly.",
   store_unavailable: "The service is unavailable. Try again shortly.",
   sign_failed: "The upload URL could not be signed. Try again.",
 };
@@ -35,6 +41,20 @@ export async function listAnomalies(idToken: string): Promise<Anomaly[]> {
 
 export async function getAnomaly(idToken: string, anomalyId: string): Promise<AnomalyDetail> {
   return request<AnomalyDetail>(`/anomalies/${encodeURIComponent(anomalyId)}`, idToken);
+}
+
+export async function explainAnomaly(idToken: string, anomalyId: string): Promise<Explanation> {
+  return request<Explanation>(`/anomalies/${encodeURIComponent(anomalyId)}/explain`, idToken, {
+    method: "POST",
+    body: "{}",
+  });
+}
+
+export async function askAnomaly(idToken: string, anomalyId: string, question: string): Promise<Explanation> {
+  return request<Explanation>(`/anomalies/${encodeURIComponent(anomalyId)}/explain`, idToken, {
+    method: "POST",
+    body: JSON.stringify({ question }),
+  });
 }
 
 export async function uploadTelemetry(idToken: string, satelliteId: string, file: File): Promise<string> {

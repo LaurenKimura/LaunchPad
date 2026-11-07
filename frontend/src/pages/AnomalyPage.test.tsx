@@ -58,6 +58,8 @@ vi.mock("../useAuth", () => ({
 
 vi.mock("../api", () => ({
   getAnomaly: vi.fn(async () => detail),
+  explainAnomaly: vi.fn(),
+  askAnomaly: vi.fn(),
 }));
 
 function renderPage() {

@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { getAnomaly } from "../api";
+import { askAnomaly, explainAnomaly, getAnomaly } from "../api";
 import { AnomalyTimeline } from "../components/AnomalyTimeline";
 import { CauseChart } from "../components/CauseChart";
+import { ExplanationPanel } from "../components/ExplanationPanel";
 import { SpaceWeatherPanel } from "../components/SpaceWeatherPanel";
 import { CAUSE_LABELS, type AnomalyDetail } from "../types";
 import { useAuth } from "../useAuth";
@@ -84,6 +85,14 @@ export function AnomalyPage() {
               </ul>
             )}
           </section>
+          {session && (
+            <ExplanationPanel
+              client={{
+                explain: () => explainAnomaly(session.idToken, anomalyId),
+                ask: (question) => askAnomaly(session.idToken, anomalyId, question),
+              }}
+            />
+          )}
         </>
       )}
     </section>

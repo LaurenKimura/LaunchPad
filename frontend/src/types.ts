@@ -61,6 +61,14 @@ export type AnomalyDetail = {
   };
 };
 
+export type Explanation = {
+  summary?: string;
+  fixes?: string[];
+  answer?: string;
+  disclaimer: string;
+  remaining: number;
+};
+
 export type Presign = {
   uploadId: string;
   url: string;
