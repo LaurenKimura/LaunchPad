@@ -6,7 +6,7 @@ Scores are estimates from 0 to 100. Each cause stands on its own: the numbers ar
 
 An hourly Lambda in [`backend/`](backend/README.md) fetches NASA DONKI, NOAA SWPC, and CelesTrak. It stores raw responses in a private S3 bucket and normalized rows in DynamoDB. The NASA key lives in Secrets Manager.
 
-A signed-in operator calls `POST /uploads` and receives a presigned POST. The file is limited to 5 MiB. After it lands, a parser converts timestamps to UTC and records each gap longer than twice the median sampling interval. A correlation Lambda then writes four independent 0–100 scores for radiation, eclipse, geomagnetic activity, and repeating software patterns. Example files are in [`samples/`](samples/README.md). The score weights are in [`backend/src/scoring_weights.json`](backend/src/scoring_weights.json).
+The web app in [`frontend/`](frontend/README.md) signs operators in with Cognito, lists their satellites and recent gaps, and uploads one telemetry file. `GET /satellites`, `GET /anomalies`, and `GET /anomalies/{anomalyId}` are Cognito-protected. A signed-in operator calls `POST /uploads` and receives a presigned POST. The file is limited to 5 MiB. After it lands, a parser converts timestamps to UTC and records each gap longer than twice the median sampling interval. A correlation Lambda then writes four independent 0–100 scores for radiation, eclipse, geomagnetic activity, and repeating software patterns. Example files are in [`samples/`](samples/README.md). The score weights are in [`backend/src/scoring_weights.json`](backend/src/scoring_weights.json). The estimate disclaimer stays in the app layout.
 
 ## Deploy
 

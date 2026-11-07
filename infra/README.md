@@ -60,7 +60,7 @@ aws dynamodb put-item \
 
 ### First operator
 
-Self sign-up is off. Create an operator with the email address they will type on the sign-in form. Replace the pool id with the `UserPoolId` output:
+Operators can sign themselves up from the web app. Cognito emails a confirmation code. An admin can still create a user. Replace the pool id with the `UserPoolId` output:
 
 ```bash
 aws cognito-idp admin-create-user \
@@ -171,6 +171,19 @@ If one upstream is down, the others still run. The failed source leaves the prev
 The Lambda role is limited to `s3:GetObject` and `s3:PutObject` on `raw/*` and `cache/*` in the external bucket, `dynamodb:PutItem` and `dynamodb:BatchWriteItem` on the space-weather and TLE tables, `dynamodb:Scan` on Satellites, and `secretsmanager:GetSecretValue` on the NASA secret.
 
 Python tests for the fetch live in `backend/` (`pytest`). See `backend/README.md`.
+
+## Operator API
+
+Every route requires a Cognito ID token in the `Authorization` header. A missing token is rejected by API Gateway. A row owned by someone else is returned as `404`, the same as a missing row.
+
+| Method | Path | What it returns |
+|---|---|---|
+| `GET` | `/satellites` | Satellites whose `ownerSub` is the caller |
+| `GET` | `/anomalies` | Newest gaps across those satellites. Optional `satelliteId` and `limit` (max 50) |
+| `GET` | `/anomalies/{anomalyId}` | One gap plus its cause scores and the estimate disclaimer |
+| `POST` | `/uploads` | A presigned POST for one CSV or JSON file |
+
+The read role can query Satellites (`byOwner` and get-by-id), Anomalies (`bySatellite`, `byAnomalyId`), and CauseScores. It cannot write those tables or read S3.
 
 ## Telemetry upload
 

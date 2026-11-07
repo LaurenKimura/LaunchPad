@@ -77,18 +77,17 @@ export class LaunchpadStack extends cdk.Stack {
     });
     new cdk.CfnOutput(this, 'UploadApiUrl', {
       value: uploadApi.url,
-      description: 'POST {url}uploads with a Cognito ID token to receive a presigned upload.',
+      description: 'API base URL. Send a Cognito ID token on /satellites, /anomalies, and /uploads.',
     });
   }
 
   /**
-   * Email is the username. Self sign-up is off: an admin creates each operator
-   * so the pool is not open to the public. The web client uses SRP and stores
-   * no secret.
+   * Email is the username. Operators can sign themselves up from the web app.
+   * An admin can still create a user. The web client uses SRP and stores no secret.
    */
   private operatorUserPool(): { pool: cognito.UserPool; client: cognito.UserPoolClient } {
     const pool = new cognito.UserPool(this, 'Operators', {
-      selfSignUpEnabled: false,
+      selfSignUpEnabled: true,
       signInAliases: { email: true },
       autoVerify: { email: true },
       // Email is the username, so Cognito already requires it. Marking email
@@ -495,12 +494,48 @@ export class LaunchpadStack extends cdk.Stack {
       resources: [resources.causeScores.tableArn],
     }));
 
+    const readFn = new lambda.Function(this, 'ReadApi', {
+      description: 'Lists the caller\'s satellites and anomalies, and returns one anomaly with its scores.',
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'read_api.handler',
+      code,
+      timeout: cdk.Duration.seconds(10),
+      memorySize: 256,
+      logGroup: new logs.LogGroup(this, 'ReadApiLogs', {
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+      environment: {
+        SATELLITES_TABLE_NAME: resources.satellites.tableName,
+        ANOMALIES_TABLE_NAME: resources.anomalies.tableName,
+        CAUSE_SCORES_TABLE_NAME: resources.causeScores.tableName,
+      },
+    });
+    readFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ListOwnedSatellites',
+      actions: ['dynamodb:Query', 'dynamodb:GetItem'],
+      resources: [resources.satellites.tableArn, `${resources.satellites.tableArn}/index/byOwner`],
+    }));
+    readFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadAnomalies',
+      actions: ['dynamodb:Query'],
+      resources: [
+        `${resources.anomalies.tableArn}/index/bySatellite`,
+        `${resources.anomalies.tableArn}/index/byAnomalyId`,
+      ],
+    }));
+    readFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadCauseScores',
+      actions: ['dynamodb:Query'],
+      resources: [resources.causeScores.tableArn],
+    }));
+
     const api = new apigateway.RestApi(this, 'UploadApi', {
       restApiName: 'launchpad-uploads',
-      description: 'Presigned telemetry uploads for signed-in operators.',
+      description: 'Operator API for satellites, anomalies, and presigned uploads.',
       defaultCorsPreflightOptions: {
         allowOrigins: apigateway.Cors.ALL_ORIGINS,
-        allowMethods: ['POST', 'OPTIONS'],
+        allowMethods: ['GET', 'POST', 'OPTIONS'],
         allowHeaders: ['Authorization', 'Content-Type'],
       },
       deployOptions: {
@@ -511,13 +546,19 @@ export class LaunchpadStack extends cdk.Stack {
     const authorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'OperatorsAuthorizer', {
       cognitoUserPools: [resources.userPool],
     });
+    const authorized = {
+      authorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    };
+    const readIntegration = new apigateway.LambdaIntegration(readFn, { proxy: true });
+    api.root.addResource('satellites').addMethod('GET', readIntegration, authorized);
+    const anomalies = api.root.addResource('anomalies');
+    anomalies.addMethod('GET', readIntegration, authorized);
+    anomalies.addResource('{anomalyId}').addMethod('GET', readIntegration, authorized);
     api.root.addResource('uploads').addMethod(
       'POST',
       new apigateway.LambdaIntegration(presignFn, { proxy: true }),
-      {
-        authorizer,
-        authorizationType: apigateway.AuthorizationType.COGNITO,
-      },
+      authorized,
     );
 
     new events.Rule(this, 'TelemetryUploadCreated', {

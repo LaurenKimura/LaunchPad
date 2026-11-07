@@ -15,7 +15,7 @@ test('operator pool uses email as the username and a public SRP client', () => {
     UsernameAttributes: ['email'],
     AutoVerifiedAttributes: ['email'],
     AdminCreateUserConfig: {
-      AllowAdminCreateUserOnly: true,
+      AllowAdminCreateUserOnly: false,
     },
     UserPoolTier: 'LITE',
     AccountRecoverySetting: {
@@ -256,6 +256,19 @@ test('upload API signs a post and the parser reads only the uploads prefix', () 
   expect(presign).toContain('uploads/*');
   expect(parser).toContain('uploads/*');
   expect(parser).toContain('lambda:InvokeFunction');
+
+  const methods = Object.values(synthesized.findResources('AWS::ApiGateway::Method')) as Array<{
+    Properties: { HttpMethod: string; AuthorizationType?: string };
+  }>;
+  const gets = methods.filter((method) => method.Properties.HttpMethod === 'GET');
+  expect(gets).toHaveLength(3);
+  expect(gets.every((method) => method.Properties.AuthorizationType === 'COGNITO_USER_POOLS')).toBe(true);
+  const readPolicy = JSON.stringify(Object.entries(policies).find(([id]) => id.startsWith('ReadApi'))?.[1]);
+  expect(readPolicy).toContain('byOwner');
+  expect(readPolicy).toContain('byAnomalyId');
+  expect(readPolicy).toContain('bySatellite');
+  expect(readPolicy).not.toContain('dynamodb:PutItem');
+  expect(readPolicy).not.toContain('s3:GetObject');
 
   synthesized.hasResourceProperties('AWS::Lambda::Function', {
     Handler: 'correlate.handler',
