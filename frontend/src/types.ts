@@ -31,10 +31,23 @@ export type TimeSpan = {
   end: string;
 };
 
+export type SaaBox = {
+  latMin: number;
+  latMax: number;
+  lonMin: number;
+  lonMax: number;
+};
+
+export type OrbitInfo = {
+  tle: { line1: string; line2: string; epoch: string } | null;
+  saa: SaaBox;
+};
+
 export type AnomalyDetail = {
   anomaly: Anomaly;
   scores: CauseScore[];
   disclaimer: string;
+  orbit: OrbitInfo;
   timeline: {
     viewStart: string;
     viewEnd: string;

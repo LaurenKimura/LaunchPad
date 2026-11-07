@@ -21,6 +21,10 @@ const detail: AnomalyDetail = {
     { causeId: "software_system", score: 0, evidence: ["No repeating pattern."] },
   ],
   disclaimer: "These scores are estimates, not confirmed root causes.",
+  orbit: {
+    tle: null,
+    saa: { latMin: -50, latMax: 0, lonMin: -90, lonMax: 40 },
+  },
   timeline: {
     viewStart: "2026-02-28T23:00:00Z",
     viewEnd: "2026-03-01T05:01:00Z",
@@ -87,6 +91,8 @@ describe("anomaly detail", () => {
     const sep = screen.getByRole("button", { name: /sep 2026-sep-1/i });
     await userEvent.tab();
     expect(screen.getByRole("link", { name: /back to dashboard/i })).toHaveFocus();
+    await userEvent.tab();
+    expect(screen.getByRole("link", { name: /3d globe/i })).toHaveFocus();
     await userEvent.tab();
     expect(anomaly).toHaveFocus();
     await userEvent.keyboard("{Enter}");

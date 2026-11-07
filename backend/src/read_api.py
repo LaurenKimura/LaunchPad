@@ -169,7 +169,11 @@ def _context(
         "eclipseStatus": "unavailable",
     }
     if start is None or end is None or end <= start:
-        return {"timeline": empty_timeline, "spaceWeather": _space_weather(records, now)}
+        return {
+            "timeline": empty_timeline,
+            "spaceWeather": _space_weather(records, now),
+            "orbit": _orbit_payload(None, load_weights()),
+        }
     weights = load_weights()
     lookback = timedelta(hours=float(weights["association_hours"]["query_lookback"]))
     view_start = start - VIEW_PAD
@@ -181,7 +185,8 @@ def _context(
         if _range_overlap(view_start, view_end, event.start, event.end) > 0
     ]
     visible.sort(key=lambda event: event.start)
-    status, eclipses = _eclipse_timeline(records, satellite_id, start, end, weights)
+    tle = records.tle_before(satellite_id, iso_utc(start))
+    status, eclipses = _eclipse_from_tle(tle, start, end, weights)
     return {
         "timeline": {
             "viewStart": iso_utc(view_start),
@@ -191,6 +196,7 @@ def _context(
             "eclipseStatus": status,
         },
         "spaceWeather": _space_weather(records, now),
+        "orbit": _orbit_payload(tle, weights),
     }
 
 
@@ -215,14 +221,32 @@ def _events_between(records: Any, start: datetime, end: datetime, weights: dict[
     return found
 
 
-def _eclipse_timeline(
-    records: Any,
-    satellite_id: str,
+def _orbit_payload(tle: Any, weights: dict[str, Any]) -> dict[str, Any]:
+    block = weights["propagation"]
+    public_tle = None
+    if isinstance(tle, dict) and tle.get("line1") and tle.get("line2"):
+        public_tle = {
+            "line1": str(tle["line1"]).strip(),
+            "line2": str(tle["line2"]).strip(),
+            "epoch": str(tle.get("epoch") or ""),
+        }
+    return {
+        "tle": public_tle,
+        "saa": {
+            "latMin": float(block["saa_lat_min"]),
+            "latMax": float(block["saa_lat_max"]),
+            "lonMin": float(block["saa_lon_min"]),
+            "lonMax": float(block["saa_lon_max"]),
+        },
+    }
+
+
+def _eclipse_from_tle(
+    tle: Any,
     start: datetime,
     end: datetime,
     weights: dict[str, Any],
 ) -> tuple[str, list[tuple[datetime, datetime]]]:
-    tle = records.tle_before(satellite_id, iso_utc(start))
     if not isinstance(tle, dict) or not tle.get("line1") or not tle.get("line2"):
         return "unavailable", []
     settings = settings_from_weights(weights)

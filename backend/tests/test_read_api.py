@@ -46,6 +46,7 @@ class Records:
         self.weather = []
         self.kp = None
         self.weather_reads = 0
+        self.tle = None
 
     def weather_between(self, start, end):
         del start, end
@@ -58,7 +59,7 @@ class Records:
 
     def tle_before(self, satellite_id, at_iso):
         del satellite_id, at_iso
-        return None
+        return self.tle
 
     def satellites_for_owner(self, owner):
         return [row for row in self.satellites.values() if row["ownerSub"] == owner]
@@ -176,9 +177,25 @@ def test_detail_timeline_keeps_overlapping_events_and_latest_kp(caplog):
     labels = [event["label"] for event in payload["timeline"]["events"]]
     assert labels == ["2026-SEP-1"]
     assert payload["timeline"]["eclipseStatus"] == "unavailable"
+    assert payload["orbit"]["tle"] is None
+    assert payload["orbit"]["saa"]["latMin"] == -50
+    assert payload["orbit"]["saa"]["lonMax"] == 40
     assert payload["spaceWeather"]["kp"] == {"value": 5, "observedAt": "2026-03-01T12:00:00Z"}
     assert {event["label"] for event in payload["spaceWeather"]["events"]} == {"2026-SEP-1", "old-flare"}
     assert "2026-SEP-1" not in caplog.text
+
+
+def test_detail_returns_the_tle_and_does_not_log_it(caplog):
+    line1 = "1 25544U 98067A   24279.50000000  .00016717  00000-0  10270-3 0  9993"
+    line2 = "2 25544  51.6400 123.4567 0006789  12.3456 347.6543 15.50000000123456"
+    records = Records()
+    records.tle = {"line1": line1, "line2": line2, "epoch": "2024-10-05T12:00:00Z"}
+    caplog.set_level(logging.INFO)
+    response = handle_request(event("/anomalies/{anomalyId}", anomaly_id="gap-0002"), records)
+    payload = body(response)
+    assert response["statusCode"] == 200
+    assert payload["orbit"]["tle"] == {"line1": line1, "line2": line2, "epoch": "2024-10-05T12:00:00Z"}
+    assert "98067A" not in caplog.text
 
 
 def test_eclipse_intervals_merge_consecutive_samples():

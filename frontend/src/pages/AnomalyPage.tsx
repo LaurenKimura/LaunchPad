@@ -40,7 +40,12 @@ export function AnomalyPage() {
       <Link className="text-sm text-cyan-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-300" to="/">
         Back to dashboard
       </Link>
-      <h1 className="mt-3 text-2xl font-medium text-slate-50">Anomaly {anomalyId}</h1>
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+        <h1 className="text-2xl font-medium text-slate-50">Anomaly {anomalyId}</h1>
+        <Link className="text-sm text-cyan-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-300" to={`/anomalies/${anomalyId}/globe`}>
+          3D globe
+        </Link>
+      </div>
       {error && (
         <p className="mt-4 rounded-md border border-rose-800 bg-rose-950 px-3 py-2 text-sm text-rose-100" role="alert">
           {error}

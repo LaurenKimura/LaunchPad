@@ -12,10 +12,12 @@
   },
   "dependencies": {
     "amazon-cognito-identity-js": "^6.3.22",
+    "cesium": "^1.147.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-router-dom": "^7.18.5",
-    "recharts": "^3.10.1"
+    "recharts": "^3.10.1",
+    "satellite.js": "^5.0.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.25.0",
@@ -35,6 +37,7 @@
     "typescript": "~5.8.3",
     "typescript-eslint": "^8.30.1",
     "vite": "^6.3.5",
+    "vite-plugin-cesium": "^1.2.23",
     "vitest": "^5.1.0"
   }
 }
