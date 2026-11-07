@@ -180,10 +180,10 @@ Every route requires a Cognito ID token in the `Authorization` header. A missing
 |---|---|---|
 | `GET` | `/satellites` | Satellites whose `ownerSub` is the caller |
 | `GET` | `/anomalies` | Newest gaps across those satellites. Optional `satelliteId` and `limit` (max 50) |
-| `GET` | `/anomalies/{anomalyId}` | One gap plus its cause scores and the estimate disclaimer |
+| `GET` | `/anomalies/{anomalyId}` | One gap, its cause scores, a timeline of overlapping space-weather and eclipse intervals, the latest Kp, and recent events |
 | `POST` | `/uploads` | A presigned POST for one CSV or JSON file |
 
-The read role can query Satellites (`byOwner` and get-by-id), Anomalies (`bySatellite`, `byAnomalyId`), and CauseScores. It cannot write those tables or read S3.
+The read role can query Satellites (`byOwner` and get-by-id), Anomalies (`bySatellite`, `byAnomalyId`), CauseScores, SpaceWeatherEvents, and TLECache. It cannot write those tables or read S3. The timeline uses the same DONKI association windows as scoring. Eclipse bars come from SGP4 over the gap. The latest Kp is the newest `noaa_kp` row at or before the request.
 
 ## Telemetry upload
 

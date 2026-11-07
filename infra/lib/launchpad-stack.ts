@@ -406,11 +406,12 @@ export class LaunchpadStack extends cdk.Stack {
         PRESIGN_EXPIRES_SECONDS: '900',
       },
     });
+    const scoredCode = correlateAsset();
     const correlateFn = new lambda.Function(this, 'CorrelateGaps', {
       description: 'Scores each anomaly window from TLE propagation and space weather.',
       runtime: lambda.Runtime.PYTHON_3_12,
       handler: 'correlate.handler',
-      code: correlateAsset(),
+      code: scoredCode,
       timeout: cdk.Duration.seconds(120),
       memorySize: 512,
       logGroup: new logs.LogGroup(this, 'CorrelateGapsLogs', {
@@ -495,12 +496,12 @@ export class LaunchpadStack extends cdk.Stack {
     }));
 
     const readFn = new lambda.Function(this, 'ReadApi', {
-      description: 'Lists the caller\'s satellites and anomalies, and returns one anomaly with its scores.',
+      description: 'Lists the caller\'s satellites and anomalies, and returns one anomaly with scores, timeline, and space weather.',
       runtime: lambda.Runtime.PYTHON_3_12,
       handler: 'read_api.handler',
-      code,
-      timeout: cdk.Duration.seconds(10),
-      memorySize: 256,
+      code: scoredCode,
+      timeout: cdk.Duration.seconds(20),
+      memorySize: 512,
       logGroup: new logs.LogGroup(this, 'ReadApiLogs', {
         retention: logs.RetentionDays.ONE_WEEK,
         removalPolicy: cdk.RemovalPolicy.DESTROY,
@@ -509,6 +510,8 @@ export class LaunchpadStack extends cdk.Stack {
         SATELLITES_TABLE_NAME: resources.satellites.tableName,
         ANOMALIES_TABLE_NAME: resources.anomalies.tableName,
         CAUSE_SCORES_TABLE_NAME: resources.causeScores.tableName,
+        SPACE_WEATHER_TABLE_NAME: resources.spaceWeather.tableName,
+        TLE_TABLE_NAME: resources.tleCache.tableName,
       },
     });
     readFn.addToRolePolicy(new iam.PolicyStatement({
@@ -528,6 +531,11 @@ export class LaunchpadStack extends cdk.Stack {
       sid: 'ReadCauseScores',
       actions: ['dynamodb:Query'],
       resources: [resources.causeScores.tableArn],
+    }));
+    readFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadSpaceWeatherAndTle',
+      actions: ['dynamodb:Query'],
+      resources: [resources.spaceWeather.tableArn, resources.tleCache.tableArn],
     }));
 
     const api = new apigateway.RestApi(this, 'UploadApi', {

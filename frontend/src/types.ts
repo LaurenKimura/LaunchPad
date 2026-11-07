@@ -19,10 +19,33 @@ export type CauseScore = {
   evidence: string[];
 };
 
+export type TimelineEvent = {
+  kind: string;
+  label: string;
+  start: string;
+  end: string;
+};
+
+export type TimeSpan = {
+  start: string;
+  end: string;
+};
+
 export type AnomalyDetail = {
   anomaly: Anomaly;
   scores: CauseScore[];
   disclaimer: string;
+  timeline: {
+    viewStart: string;
+    viewEnd: string;
+    events: TimelineEvent[];
+    eclipses: TimeSpan[];
+    eclipseStatus: "unavailable" | "computed";
+  };
+  spaceWeather: {
+    kp: { value: number; observedAt: string } | null;
+    events: TimelineEvent[];
+  };
 };
 
 export type Presign = {

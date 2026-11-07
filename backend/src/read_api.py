@@ -14,10 +14,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-from scoring import CAUSE_IDS, DISCLAIMER
+from gaps import iso_utc
+from propagate import OrbitFix, propagate_window, settings_from_weights
+from scoring import CAUSE_IDS, DISCLAIMER, interval_from_record, load_weights
 from store import StoreError
 from upload_keys import SATELLITE_ID
 
@@ -27,6 +30,11 @@ DEFAULT_LIMIT = 20
 MAX_LIMIT = 50
 MAX_SATELLITES = 50
 ANOMALY_ID = SATELLITE_ID
+VIEW_PAD = timedelta(hours=3)
+RECENT_WEATHER = timedelta(days=7)
+MAX_TIMELINE_EVENTS = 12
+MAX_RECENT_EVENTS = 8
+DONKI_DATASETS = ("donki_sep", "donki_flr", "donki_cme", "donki_gst")
 
 
 def handler(event: dict[str, Any] | None, context: object) -> dict[str, Any]:
@@ -96,7 +104,7 @@ def list_anomalies(records: Any, owner: str, query: dict[str, Any]) -> dict[str,
     return {"anomalies": [_public_anomaly(row) for row in found[:limit]]}
 
 
-def get_anomaly(records: Any, owner: str, anomaly_id: Any) -> dict[str, Any]:
+def get_anomaly(records: Any, owner: str, anomaly_id: Any, now: datetime | None = None) -> dict[str, Any]:
     if not isinstance(anomaly_id, str) or ANOMALY_ID.fullmatch(anomaly_id) is None:
         raise ReadError(400, "invalid_anomaly")
     row = records.anomaly(anomaly_id)
@@ -107,19 +115,173 @@ def get_anomaly(records: Any, owner: str, anomaly_id: Any) -> dict[str, Any]:
         raise ReadError(404, "not_found")
     scores = [_public_score(item) for item in records.scores_for_anomaly(anomaly_id)]
     scores.sort(key=lambda item: _cause_order(item["causeId"]))
+    start = _parse_time(str(row.get("startTime") or ""))
+    end = _parse_time(str(row.get("endTime") or ""))
+    context = _context(records, satellite_id, start, end, now or datetime.now(timezone.utc))
     return {
         "anomaly": _public_anomaly(row),
         "scores": scores,
         "disclaimer": DISCLAIMER,
+        **context,
     }
 
 
+def eclipse_intervals(samples: list[OrbitFix], sample_seconds: int) -> list[tuple[datetime, datetime]]:
+    """Collapse consecutive in-shadow samples into [start, end) intervals."""
+
+    intervals: list[tuple[datetime, datetime]] = []
+    run_start: datetime | None = None
+    previous: datetime | None = None
+    step = timedelta(seconds=max(sample_seconds, 1))
+    for sample in samples:
+        if not sample.ok:
+            if run_start is not None and previous is not None:
+                intervals.append((run_start, previous + step))
+            run_start = None
+            previous = None
+            continue
+        if sample.in_eclipse:
+            if run_start is None:
+                run_start = sample.at
+            previous = sample.at
+            continue
+        if run_start is not None:
+            intervals.append((run_start, sample.at))
+        run_start = None
+        previous = None
+    if run_start is not None and previous is not None:
+        intervals.append((run_start, previous + step))
+    return intervals
+
+
+def _context(
+    records: Any,
+    satellite_id: str,
+    start: datetime | None,
+    end: datetime | None,
+    now: datetime,
+) -> dict[str, Any]:
+    empty_timeline = {
+        "viewStart": "",
+        "viewEnd": "",
+        "events": [],
+        "eclipses": [],
+        "eclipseStatus": "unavailable",
+    }
+    if start is None or end is None or end <= start:
+        return {"timeline": empty_timeline, "spaceWeather": _space_weather(records, now)}
+    weights = load_weights()
+    lookback = timedelta(hours=float(weights["association_hours"]["query_lookback"]))
+    view_start = start - VIEW_PAD
+    view_end = end + VIEW_PAD
+    overlapping = _events_between(records, start - lookback, end, weights)
+    visible = [
+        event
+        for event in overlapping
+        if _range_overlap(view_start, view_end, event.start, event.end) > 0
+    ]
+    visible.sort(key=lambda event: event.start)
+    status, eclipses = _eclipse_timeline(records, satellite_id, start, end, weights)
+    return {
+        "timeline": {
+            "viewStart": iso_utc(view_start),
+            "viewEnd": iso_utc(view_end),
+            "events": [_public_event(event) for event in visible[:MAX_TIMELINE_EVENTS]],
+            "eclipses": [{"start": iso_utc(item[0]), "end": iso_utc(item[1])} for item in eclipses],
+            "eclipseStatus": status,
+        },
+        "spaceWeather": _space_weather(records, now),
+    }
+
+
+def _space_weather(records: Any, now: datetime) -> dict[str, Any]:
+    weights = load_weights()
+    recent = _events_between(records, now - RECENT_WEATHER, now, weights)
+    recent.sort(key=lambda event: event.start, reverse=True)
+    kp_row = records.latest_kp(now)
+    kp = None
+    if isinstance(kp_row, dict) and kp_row.get("kp") is not None:
+        observed = str(kp_row.get("observedAt") or "")
+        kp = {"value": _number(kp_row.get("kp")), "observedAt": observed.split("#", 1)[0]}
+    return {"kp": kp, "events": [_public_event(event) for event in recent[:MAX_RECENT_EVENTS]]}
+
+
+def _events_between(records: Any, start: datetime, end: datetime, weights: dict[str, Any]) -> list[Any]:
+    found = []
+    for row in records.weather_between(start, end):
+        event = interval_from_record(row, weights["association_hours"])
+        if event is not None:
+            found.append(event)
+    return found
+
+
+def _eclipse_timeline(
+    records: Any,
+    satellite_id: str,
+    start: datetime,
+    end: datetime,
+    weights: dict[str, Any],
+) -> tuple[str, list[tuple[datetime, datetime]]]:
+    tle = records.tle_before(satellite_id, iso_utc(start))
+    if not isinstance(tle, dict) or not tle.get("line1") or not tle.get("line2"):
+        return "unavailable", []
+    settings = settings_from_weights(weights)
+    try:
+        result = propagate_window(str(tle["line1"]), str(tle["line2"]), start, end, settings)
+    except Exception:
+        logger.warning("eclipse_timeline_failed")
+        return "unavailable", []
+    if result.failure or not any(sample.ok for sample in result.samples):
+        return "unavailable", []
+    return "computed", eclipse_intervals(result.samples, settings.sample_seconds)
+
+
+def _public_event(event: Any) -> dict[str, str]:
+    return {
+        "kind": str(event.kind),
+        "label": str(event.label),
+        "start": iso_utc(event.start),
+        "end": iso_utc(event.end),
+    }
+
+
+def _range_overlap(left_start: datetime, left_end: datetime, right_start: datetime, right_end: datetime) -> float:
+    latest = max(left_start, right_start)
+    earliest = min(left_end, right_end)
+    return max(0.0, (earliest - latest).total_seconds())
+
+
+def _parse_time(value: str) -> datetime | None:
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
 class DynamoRecords:
-    def __init__(self, client: Any, satellites: str, anomalies: str, scores: str) -> None:
+    def __init__(
+        self,
+        client: Any,
+        satellites: str,
+        anomalies: str,
+        scores: str,
+        weather: str = "",
+        tle: str = "",
+    ) -> None:
         self._client = client
         self._satellites = satellites
         self._anomalies = anomalies
         self._scores = scores
+        self._weather = weather
+        self._tle = tle
 
     def satellites_for_owner(self, owner: str) -> list[dict[str, Any]]:
         items = _query(
@@ -187,6 +349,68 @@ class DynamoRecords:
         )
         return [_decode(item) for item in items]
 
+    def weather_between(self, start: datetime, end: datetime) -> list[dict[str, Any]]:
+        if not self._weather:
+            return []
+        start_key = iso_utc(start)
+        end_key = iso_utc(end) + "~"
+        found: list[dict[str, Any]] = []
+        for dataset in DONKI_DATASETS:
+            items = _query(
+                self._client,
+                {
+                    "TableName": self._weather,
+                    "KeyConditionExpression": "dataset = :dataset AND observedAt BETWEEN :start AND :end",
+                    "ExpressionAttributeValues": {
+                        ":dataset": {"S": dataset},
+                        ":start": {"S": start_key},
+                        ":end": {"S": end_key},
+                    },
+                },
+            )
+            found.extend(_decode(item) for item in items)
+        return found
+
+    def latest_kp(self, at: datetime) -> dict[str, Any] | None:
+        if not self._weather:
+            return None
+        items = _query(
+            self._client,
+            {
+                "TableName": self._weather,
+                "KeyConditionExpression": "dataset = :dataset AND observedAt <= :at",
+                "ExpressionAttributeValues": {
+                    ":dataset": {"S": "noaa_kp"},
+                    ":at": {"S": iso_utc(at) + "~"},
+                },
+                "ScanIndexForward": False,
+                "Limit": 1,
+            },
+        )
+        if not items:
+            return None
+        return _decode(items[0])
+
+    def tle_before(self, satellite_id: str, at_iso: str) -> dict[str, Any] | None:
+        if not self._tle:
+            return None
+        items = _query(
+            self._client,
+            {
+                "TableName": self._tle,
+                "KeyConditionExpression": "satelliteId = :satellite AND epoch <= :at",
+                "ExpressionAttributeValues": {
+                    ":satellite": {"S": satellite_id},
+                    ":at": {"S": at_iso},
+                },
+                "ScanIndexForward": False,
+                "Limit": 1,
+            },
+        )
+        if not items:
+            return None
+        return _decode(items[0])
+
 
 def deps_from_env() -> DynamoRecords:
     import boto3
@@ -196,6 +420,8 @@ def deps_from_env() -> DynamoRecords:
         _required("SATELLITES_TABLE_NAME"),
         _required("ANOMALIES_TABLE_NAME"),
         _required("CAUSE_SCORES_TABLE_NAME"),
+        _required("SPACE_WEATHER_TABLE_NAME"),
+        _required("TLE_TABLE_NAME"),
     )
 
 

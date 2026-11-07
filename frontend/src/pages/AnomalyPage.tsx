@@ -1,8 +1,11 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { getAnomaly } from "../api";
-import { useAuth } from "../useAuth";
+import { AnomalyTimeline } from "../components/AnomalyTimeline";
+import { CauseChart } from "../components/CauseChart";
+import { SpaceWeatherPanel } from "../components/SpaceWeatherPanel";
 import { CAUSE_LABELS, type AnomalyDetail } from "../types";
+import { useAuth } from "../useAuth";
 
 export function AnomalyPage() {
   const { anomalyId = "" } = useParams();
@@ -34,7 +37,7 @@ export function AnomalyPage() {
 
   return (
     <section>
-      <Link className="text-sm text-cyan-200" to="/">
+      <Link className="text-sm text-cyan-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-300" to="/">
         Back to dashboard
       </Link>
       <h1 className="mt-3 text-2xl font-medium text-slate-50">Anomaly {anomalyId}</h1>
@@ -49,24 +52,33 @@ export function AnomalyPage() {
           <p className="mt-2 font-mono text-sm text-slate-400">
             {detail.anomaly.satelliteId} · {detail.anomaly.startTime} UTC to {detail.anomaly.endTime} UTC
           </p>
-          <p className="mt-4 text-sm text-slate-300">Each score is an independent 0–100 estimate. The numbers are not shares of one total.</p>
-          {detail.scores.length === 0 ? (
-            <p className="mt-4 text-sm text-slate-400">Scores are not ready yet. Correlation runs after the file is parsed.</p>
-          ) : (
-            <ul className="mt-4 grid gap-4 md:grid-cols-2">
-              {detail.scores.map((score) => (
-                <li className="rounded-md border border-slate-800 bg-[#0c1824] p-4" key={score.causeId}>
-                  <p className="text-sm text-slate-400">{CAUSE_LABELS[score.causeId] ?? score.causeId}</p>
-                  <p className="mt-1 font-mono text-3xl text-slate-50">{score.score}</p>
-                  <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-slate-300">
-                    {score.evidence.map((line) => (
-                      <li key={line}>{line}</li>
-                    ))}
-                  </ul>
-                </li>
-              ))}
-            </ul>
-          )}
+          <div className="mt-6 grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">
+            <CauseChart scores={detail.scores} />
+            <SpaceWeatherPanel weather={detail.spaceWeather} />
+          </div>
+          <AnomalyTimeline detail={detail} />
+          <section aria-labelledby="evidence-title" className="mt-8">
+            <h2 id="evidence-title" className="text-lg font-medium text-slate-50">
+              Evidence
+            </h2>
+            {detail.scores.length === 0 ? (
+              <p className="mt-3 text-sm text-slate-400">No evidence is stored for this gap yet.</p>
+            ) : (
+              <ul className="mt-4 grid gap-4 md:grid-cols-2">
+                {detail.scores.map((score) => (
+                  <li className="rounded-md border border-slate-800 bg-[#0c1824] p-4" key={score.causeId}>
+                    <h3 className="text-sm text-slate-400">{CAUSE_LABELS[score.causeId] ?? score.causeId}</h3>
+                    <p className="mt-1 font-mono text-3xl text-slate-50">{score.score}</p>
+                    <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-slate-300">
+                      {score.evidence.map((line) => (
+                        <li key={line}>{line}</li>
+                      ))}
+                    </ul>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
         </>
       )}
     </section>
