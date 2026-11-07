@@ -1,6 +1,8 @@
-# LaunchPad fetch Lambda
+# LaunchPad backend
 
-Hourly Python function. EventBridge in the CDK stack starts it. It collects public space-weather and orbit data used later when an upload is diagnosed.
+Python Lambdas for the dashboard. The CDK app in `infra/` deploys them.
+
+`handler.handler` collects space weather and TLEs every hour. `presign.handler` returns a presigned upload. `parse_upload.handler` reads that file and records gap windows. Neither path logs raw telemetry or a presigned URL.
 
 ## Sources
 
@@ -31,6 +33,14 @@ Logs contain the source name, status, item count, and a short error code. They d
 NOAA rows use a plain ISO-8601 UTC `observedAt`. DONKI rows use `{timestamp}#{eventId}` so two events at the same second are both stored. Query details are in [`infra/README.md`](../infra/README.md).
 
 TLE rows use `satelliteId` and the element-set epoch. The epoch is taken from columns 19-32 of TLE line 1.
+
+## Telemetry upload
+
+`POST /uploads` checks that the satellite belongs to the caller, writes a pending Uploads row, and returns a presigned POST. The S3 policy allows 1 byte through 5 MiB by default (`MAX_UPLOAD_BYTES`).
+
+The parser accepts CSV or JSON. A timestamp may carry a zone offset. A timestamp with no zone is read as UTC. A gap is two neighboring samples more than `GAP_INTERVAL_MULTIPLIER` times the median positive interval apart. The default multiplier is 2. Each gap becomes one Anomalies item. The window starts at the sample before the hole and ends at the sample after it.
+
+Sample files are in [`samples/`](../samples/README.md). The unit tests load those files.
 
 ## Tests
 

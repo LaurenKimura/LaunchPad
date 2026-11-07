@@ -11,8 +11,10 @@ This stack creates:
 - Six on-demand DynamoDB tables for satellites, uploads, anomalies, cause scores, space-weather samples, and cached TLEs
 - A Secrets Manager secret for the NASA API key
 - An hourly Lambda, started by EventBridge, that archives those responses and writes normalized rows
+- `POST /uploads` on API Gateway. A signed-in operator receives a presigned POST for one CSV or JSON file
+- A parser Lambda, started by the S3 object-created event, that records gap windows on the Anomalies table
 
-Scoring code, API Gateway, and Bedrock are not in this stack yet. The fetch Lambda cannot read the telemetry bucket.
+Scoring code and Bedrock are not in this stack yet. The fetch Lambda cannot read the telemetry bucket.
 
 Account and region come from your AWS CLI configuration. No account id, region, or secret is stored in the repo.
 
@@ -168,6 +170,35 @@ The Lambda role is limited to `s3:GetObject` and `s3:PutObject` on `raw/*` and `
 
 Python tests for the fetch live in `backend/` (`pytest`). See `backend/README.md`.
 
+## Telemetry upload
+
+`POST {UploadApiUrl}uploads` with a Cognito ID token in `Authorization`. The token is the ID token from the operator pool. The body is JSON:
+
+```json
+{"satelliteId": "iss", "contentType": "text/csv"}
+```
+
+`contentType` is `text/csv` or `application/json`. The satellite must belong to the caller. A missing satellite and a satellite owned by someone else both return `404`, so callers cannot probe ids.
+
+The response is a presigned POST, not a PUT. S3 rejects an object outside 1 byte to 5 MiB (`MAX_UPLOAD_BYTES`). The signed policy also pins the object key, the content type, and SSE-S3. The URL expires in 15 minutes. Send the returned `fields` as form fields and the file last, under the field name `file`. The uploads bucket allows browser POST from any origin so the later web app can upload. Tighten that origin when the site hostname is known.
+
+The object key is `uploads/{satelliteId}/{uploadId}/{uploadedAt}/telemetry.csv` (or `.json`). The client's filename is not used.
+
+When the object is created, EventBridge invokes the parser. The parser:
+
+- ignores keys that do not match that pattern, and does not download them
+- rejects a file larger than 5 MiB or more than 100,000 timestamp rows
+- accepts CSV with a `timestamp`, `time`, or `ts` column, or JSON as a list or as `{ "samples" | "records" | "data": [...] }`
+- converts each timestamp to UTC (an offset is honored; a timestamp with no zone is read as UTC)
+- flags a gap when two neighboring samples are more than `GAP_INTERVAL_MULTIPLIER` times the median positive interval apart (default 2)
+- writes one Anomalies row per gap window and sets the upload status to `parsed` or `rejected`
+
+A bad file is a finished result, not a retry. An S3 or DynamoDB error is retried twice. Logs contain the upload id, the sample count, the gap count, and an error code. They do not contain the file body or the presigned URL.
+
+The presign role can `s3:PutObject` on `uploads/*`, `dynamodb:GetItem` on Satellites, and `dynamodb:PutItem` on Uploads. The parser role can `s3:GetObject` on `uploads/*`, get and update Uploads, and put Anomalies rows. Neither role can delete an object.
+
+Sample files and the expected gap windows are in [`samples/README.md`](../samples/README.md).
+
 ## What this stack does not do
 
-It does not accept telemetry uploads, score anomalies, or call Bedrock. Those policies arrive with the Lambdas that need them. Do not log raw telemetry.
+It does not score anomalies or call Bedrock. Do not log raw telemetry.

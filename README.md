@@ -6,6 +6,8 @@ Scores are estimates from 0 to 100. Each cause stands on its own: the numbers ar
 
 An hourly Lambda in [`backend/`](backend/README.md) fetches NASA DONKI, NOAA SWPC, and CelesTrak. It stores raw responses in a private S3 bucket and normalized rows in DynamoDB. The NASA key lives in Secrets Manager.
 
+A signed-in operator calls `POST /uploads` and receives a presigned POST. The file is limited to 5 MiB. After it lands, a parser converts timestamps to UTC and records each gap longer than twice the median sampling interval. Example files are in [`samples/`](samples/README.md).
+
 ## Deploy
 
 Infrastructure is an AWS CDK app in [`infra/`](infra/README.md). From a machine with the AWS CLI configured for the account and region you want:

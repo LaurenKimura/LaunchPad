@@ -1,5 +1,6 @@
 import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib/core';
+import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as events from 'aws-cdk-lib/aws-events';
@@ -15,8 +16,9 @@ import { Construct } from 'constructs';
  * Foundation for the LaunchPad satellite anomaly dashboard.
  *
  * Operators sign in with email. Telemetry files land in a private encrypted
- * bucket. An hourly Lambda archives public space-weather and TLE responses
- * and writes normalized rows. Scoring and Bedrock are not part of this stack.
+ * bucket. An hourly Lambda archives public space-weather and TLE responses.
+ * Operators request a presigned upload, and a parser records gap windows.
+ * Scoring and Bedrock are not part of this stack.
  */
 export class LaunchpadStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -34,6 +36,13 @@ export class LaunchpadStack extends cdk.Stack {
     const rawResponses = this.rawResponsesBucket();
     const nasaSecret = this.nasaSecret();
     this.hourlyExternalFetch({ rawResponses, nasaSecret, satellites, spaceWeather, tleCache });
+    const uploadApi = this.telemetryUpload({
+      userPool: operators.pool,
+      uploads,
+      satellites,
+      uploadRecords,
+      anomalies,
+    });
 
     new cdk.CfnOutput(this, 'UserPoolId', {
       value: operators.pool.userPoolId,
@@ -60,6 +69,10 @@ export class LaunchpadStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'NasaDonkiSecretArn', {
       value: nasaSecret.secretArn,
       description: 'Secrets Manager ARN. Replace the generated value with a NASA API key.',
+    });
+    new cdk.CfnOutput(this, 'UploadApiUrl', {
+      value: uploadApi.url,
+      description: 'POST {url}uploads with a Cognito ID token to receive a presigned upload.',
     });
   }
 
@@ -106,7 +119,8 @@ export class LaunchpadStack extends cdk.Stack {
   /**
    * Telemetry files only. Public access is blocked, TLS is required, and
    * objects are encrypted with an S3-managed key. Versioning keeps a previous
-   * copy if an upload is overwritten. The bucket is retained on stack delete.
+   * copy if an upload is overwritten. Object-created events are published so
+   * the parser can run. The bucket is retained on stack delete.
    */
   private uploadsBucket(): s3.Bucket {
     return new s3.Bucket(this, 'UploadsBucket', {
@@ -114,7 +128,17 @@ export class LaunchpadStack extends cdk.Stack {
       encryption: s3.BucketEncryption.S3_MANAGED,
       enforceSSL: true,
       versioned: true,
+      eventBridgeEnabled: true,
       objectOwnership: s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
+      cors: [
+        {
+          allowedMethods: [s3.HttpMethods.POST, s3.HttpMethods.PUT, s3.HttpMethods.HEAD],
+          allowedOrigins: ['*'],
+          allowedHeaders: ['*'],
+          exposedHeaders: ['ETag'],
+          maxAge: 3000,
+        },
+      ],
       lifecycleRules: [
         {
           abortIncompleteMultipartUploadAfter: cdk.Duration.days(7),
@@ -328,6 +352,135 @@ export class LaunchpadStack extends cdk.Stack {
       schedule: events.Schedule.rate(cdk.Duration.hours(1)),
       targets: [new targets.LambdaFunction(fetchFn)],
     });
+  }
+
+  /**
+   * Presigned POST for one telemetry file, then a parser on the S3 event.
+   * The presign role can write the pending upload row and sign PutObject.
+   * The parser role can read that object and write anomaly windows.
+   * Neither role can delete objects or read the external-data bucket.
+   */
+  private telemetryUpload(resources: {
+    userPool: cognito.UserPool;
+    uploads: s3.Bucket;
+    satellites: dynamodb.Table;
+    uploadRecords: dynamodb.Table;
+    anomalies: dynamodb.Table;
+  }): apigateway.RestApi {
+    const backendSrc = path.resolve(__dirname, '../../backend/src');
+    const code = lambda.Code.fromAsset(backendSrc, {
+      exclude: ['**/__pycache__/**', '**/*.pyc'],
+    });
+    const presignFn = new lambda.Function(this, 'PresignUpload', {
+      description: 'Returns a presigned POST for one telemetry file.',
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'presign.handler',
+      code,
+      timeout: cdk.Duration.seconds(10),
+      memorySize: 256,
+      logGroup: new logs.LogGroup(this, 'PresignUploadLogs', {
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+      environment: {
+        UPLOADS_BUCKET_NAME: resources.uploads.bucketName,
+        UPLOADS_TABLE_NAME: resources.uploadRecords.tableName,
+        SATELLITES_TABLE_NAME: resources.satellites.tableName,
+        MAX_UPLOAD_BYTES: '5242880',
+        PRESIGN_EXPIRES_SECONDS: '900',
+      },
+    });
+    const parserFn = new lambda.Function(this, 'ParseUpload', {
+      description: 'Validates an uploaded telemetry file and records gap windows.',
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'parse_upload.handler',
+      code,
+      timeout: cdk.Duration.seconds(60),
+      memorySize: 512,
+      logGroup: new logs.LogGroup(this, 'ParseUploadLogs', {
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+      environment: {
+        UPLOADS_BUCKET_NAME: resources.uploads.bucketName,
+        UPLOADS_TABLE_NAME: resources.uploadRecords.tableName,
+        ANOMALIES_TABLE_NAME: resources.anomalies.tableName,
+        MAX_UPLOAD_BYTES: '5242880',
+        MAX_UPLOAD_ROWS: '100000',
+        GAP_INTERVAL_MULTIPLIER: '2',
+      },
+    });
+
+    presignFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'SignTelemetryUpload',
+      actions: ['s3:PutObject'],
+      resources: [resources.uploads.arnForObjects('uploads/*')],
+    }));
+    presignFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadSatelliteOwner',
+      actions: ['dynamodb:GetItem'],
+      resources: [resources.satellites.tableArn],
+    }));
+    presignFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'CreatePendingUpload',
+      actions: ['dynamodb:PutItem'],
+      resources: [resources.uploadRecords.tableArn],
+    }));
+
+    parserFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadTelemetryUpload',
+      actions: ['s3:GetObject'],
+      resources: [resources.uploads.arnForObjects('uploads/*')],
+    }));
+    parserFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'UpdateUploadStatus',
+      actions: ['dynamodb:GetItem', 'dynamodb:UpdateItem'],
+      resources: [resources.uploadRecords.tableArn],
+    }));
+    parserFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'WriteAnomalyWindows',
+      actions: ['dynamodb:PutItem', 'dynamodb:BatchWriteItem'],
+      resources: [resources.anomalies.tableArn],
+    }));
+
+    const api = new apigateway.RestApi(this, 'UploadApi', {
+      restApiName: 'launchpad-uploads',
+      description: 'Presigned telemetry uploads for signed-in operators.',
+      defaultCorsPreflightOptions: {
+        allowOrigins: apigateway.Cors.ALL_ORIGINS,
+        allowMethods: ['POST', 'OPTIONS'],
+        allowHeaders: ['Authorization', 'Content-Type'],
+      },
+      deployOptions: {
+        throttlingRateLimit: 10,
+        throttlingBurstLimit: 20,
+      },
+    });
+    const authorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'OperatorsAuthorizer', {
+      cognitoUserPools: [resources.userPool],
+    });
+    api.root.addResource('uploads').addMethod(
+      'POST',
+      new apigateway.LambdaIntegration(presignFn, { proxy: true }),
+      {
+        authorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+      },
+    );
+
+    new events.Rule(this, 'TelemetryUploadCreated', {
+      description: 'Parse a telemetry file after it is created in the uploads bucket.',
+      eventPattern: {
+        source: ['aws.s3'],
+        detailType: ['Object Created'],
+        detail: {
+          bucket: { name: [resources.uploads.bucketName] },
+          object: { key: [{ prefix: 'uploads/' }] },
+        },
+      },
+      targets: [new targets.LambdaFunction(parserFn, { retryAttempts: 2 })],
+    });
+    return api;
   }
 }
 

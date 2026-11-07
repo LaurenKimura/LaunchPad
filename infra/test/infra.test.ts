@@ -185,17 +185,73 @@ test('hourly fetch runs from EventBridge and cannot read telemetry uploads', () 
     },
   });
 
-  const policies = JSON.stringify(synthesized.findResources('AWS::IAM::Policy'));
-  expect(policies).toContain('secretsmanager:GetSecretValue');
-  expect(policies).toContain('dynamodb:Scan');
-  expect(policies).toContain('dynamodb:BatchWriteItem');
-  expect(policies).not.toContain('dynamodb:DeleteItem');
-  expect(policies).not.toContain('s3:DeleteObject');
-  expect(policies).not.toContain('s3:GetObject*');
+  const policies = synthesized.findResources('AWS::IAM::Policy');
+  const allPolicies = JSON.stringify(policies);
+  expect(allPolicies).toContain('secretsmanager:GetSecretValue');
+  expect(allPolicies).toContain('dynamodb:BatchWriteItem');
+  expect(allPolicies).not.toContain('dynamodb:DeleteItem');
+  expect(allPolicies).not.toContain('s3:DeleteObject');
+  expect(allPolicies).not.toContain('s3:GetObject*');
 
-  const uploadsBucket = Object.entries(synthesized.findResources('AWS::S3::Bucket'))
-    .find(([logicalId]) => logicalId.startsWith('UploadsBucket'));
-  expect(uploadsBucket).toBeDefined();
-  const uploadsRef = uploadsBucket?.[0];
-  expect(policies).not.toContain(uploadsRef);
+  const fetchPolicy = Object.entries(policies).find(([logicalId]) => logicalId.startsWith('ExternalFetch'));
+  expect(fetchPolicy).toBeDefined();
+  const fetchJson = JSON.stringify(fetchPolicy?.[1]);
+  expect(fetchJson).toContain('dynamodb:Scan');
+  expect(fetchJson).not.toContain('UploadsBucket');
+});
+
+test('upload API signs a post and the parser reads only the uploads prefix', () => {
+  const synthesized = template();
+
+  synthesized.resourceCountIs('AWS::Events::Rule', 2);
+  synthesized.hasResourceProperties('AWS::ApiGateway::Method', {
+    HttpMethod: 'POST',
+    AuthorizationType: 'COGNITO_USER_POOLS',
+  });
+  synthesized.hasResourceProperties('AWS::Lambda::Function', {
+    Handler: 'presign.handler',
+    Timeout: 10,
+    Environment: {
+      Variables: Match.objectLike({
+        MAX_UPLOAD_BYTES: '5242880',
+        PRESIGN_EXPIRES_SECONDS: '900',
+      }),
+    },
+  });
+  synthesized.hasResourceProperties('AWS::Lambda::Function', {
+    Handler: 'parse_upload.handler',
+    Timeout: 60,
+    MemorySize: 512,
+    Environment: {
+      Variables: Match.objectLike({
+        GAP_INTERVAL_MULTIPLIER: '2',
+        MAX_UPLOAD_ROWS: '100000',
+      }),
+    },
+  });
+  synthesized.hasResourceProperties('Custom::S3BucketNotifications', {
+    NotificationConfiguration: {
+      EventBridgeConfiguration: {},
+    },
+  });
+  synthesized.hasResourceProperties('AWS::Events::Rule', {
+    EventPattern: Match.objectLike({
+      source: ['aws.s3'],
+      'detail-type': ['Object Created'],
+    }),
+  });
+
+  const rules = JSON.stringify(synthesized.findResources('AWS::Events::Rule'));
+  expect(rules).toContain('uploads/');
+
+  const policies = synthesized.findResources('AWS::IAM::Policy');
+  const presign = JSON.stringify(Object.entries(policies).find(([id]) => id.startsWith('PresignUpload'))?.[1]);
+  const parser = JSON.stringify(Object.entries(policies).find(([id]) => id.startsWith('ParseUpload'))?.[1]);
+  expect(presign).toContain('s3:PutObject');
+  expect(presign).not.toContain('s3:GetObject');
+  expect(parser).toContain('s3:GetObject');
+  expect(parser).toContain('dynamodb:UpdateItem');
+  expect(parser).not.toContain('s3:PutObject');
+  expect(presign).toContain('uploads/*');
+  expect(parser).toContain('uploads/*');
 });
