@@ -163,3 +163,39 @@ function indexesOf(tables: CfnResources, idPrefix: string): Record<string, strin
 function keyOrder(keyType: string): number {
   return keyType === 'HASH' ? 0 : 1;
 }
+
+test('hourly fetch runs from EventBridge and cannot read telemetry uploads', () => {
+  const synthesized = template();
+
+  synthesized.resourceCountIs('AWS::S3::Bucket', 2);
+  synthesized.resourceCountIs('AWS::SecretsManager::Secret', 1);
+  synthesized.hasResourceProperties('AWS::Events::Rule', {
+    ScheduleExpression: 'rate(1 hour)',
+    State: 'ENABLED',
+  });
+  synthesized.hasResourceProperties('AWS::Lambda::Function', {
+    Runtime: 'python3.12',
+    Handler: 'handler.handler',
+    Timeout: 300,
+    MemorySize: 256,
+    Environment: {
+      Variables: Match.objectLike({
+        DONKI_LOOKBACK_DAYS: '7',
+      }),
+    },
+  });
+
+  const policies = JSON.stringify(synthesized.findResources('AWS::IAM::Policy'));
+  expect(policies).toContain('secretsmanager:GetSecretValue');
+  expect(policies).toContain('dynamodb:Scan');
+  expect(policies).toContain('dynamodb:BatchWriteItem');
+  expect(policies).not.toContain('dynamodb:DeleteItem');
+  expect(policies).not.toContain('s3:DeleteObject');
+  expect(policies).not.toContain('s3:GetObject*');
+
+  const uploadsBucket = Object.entries(synthesized.findResources('AWS::S3::Bucket'))
+    .find(([logicalId]) => logicalId.startsWith('UploadsBucket'));
+  expect(uploadsBucket).toBeDefined();
+  const uploadsRef = uploadsBucket?.[0];
+  expect(policies).not.toContain(uploadsRef);
+});

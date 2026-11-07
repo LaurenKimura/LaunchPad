@@ -1,15 +1,22 @@
+import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib/core';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as events from 'aws-cdk-lib/aws-events';
+import * as targets from 'aws-cdk-lib/aws-events-targets';
+import * as iam from 'aws-cdk-lib/aws-iam';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as logs from 'aws-cdk-lib/aws-logs';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
 
 /**
  * Foundation for the LaunchPad satellite anomaly dashboard.
  *
  * Operators sign in with email. Telemetry files land in a private encrypted
- * bucket. Diagnosis state lives in the on-demand tables below. Scoring and
- * Bedrock are not part of this stack.
+ * bucket. An hourly Lambda archives public space-weather and TLE responses
+ * and writes normalized rows. Scoring and Bedrock are not part of this stack.
  */
 export class LaunchpadStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -24,6 +31,9 @@ export class LaunchpadStack extends cdk.Stack {
     const causeScores = this.causeScoresTable();
     const spaceWeather = this.spaceWeatherTable();
     const tleCache = this.tleCacheTable();
+    const rawResponses = this.rawResponsesBucket();
+    const nasaSecret = this.nasaSecret();
+    this.hourlyExternalFetch({ rawResponses, nasaSecret, satellites, spaceWeather, tleCache });
 
     new cdk.CfnOutput(this, 'UserPoolId', {
       value: operators.pool.userPoolId,
@@ -43,6 +53,14 @@ export class LaunchpadStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'CauseScoresTableName', { value: causeScores.tableName });
     new cdk.CfnOutput(this, 'SpaceWeatherEventsTableName', { value: spaceWeather.tableName });
     new cdk.CfnOutput(this, 'TleCacheTableName', { value: tleCache.tableName });
+    new cdk.CfnOutput(this, 'ExternalRawBucketName', {
+      value: rawResponses.bucketName,
+      description: 'Private bucket for raw DONKI, NOAA, and CelesTrak responses.',
+    });
+    new cdk.CfnOutput(this, 'NasaDonkiSecretArn', {
+      value: nasaSecret.secretArn,
+      description: 'Secrets Manager ARN. Replace the generated value with a NASA API key.',
+    });
   }
 
   /**
@@ -191,7 +209,11 @@ export class LaunchpadStack extends cdk.Stack {
    *
    * Query dataset plus an observedAt range for the samples that overlap a gap.
    * Query dataset and observedAt <= gap time, newest first, limit 1, for the
-   * sample in effect. observedAt is ISO-8601 UTC.
+   * sample in effect.
+   *
+   * NOAA rows store a plain ISO-8601 UTC timestamp. DONKI rows store
+   * `{timestamp}#{eventId}` so two events at the same second both remain.
+   * A range end of `{end}~` includes those ids, because `~` sorts after `#`.
    */
   private spaceWeatherTable(): dynamodb.Table {
     return diagnosticTable(this, 'SpaceWeatherEvents', 'dataset', 'observedAt');
@@ -207,6 +229,105 @@ export class LaunchpadStack extends cdk.Stack {
    */
   private tleCacheTable(): dynamodb.Table {
     return diagnosticTable(this, 'TleCache', 'satelliteId', 'epoch');
+  }
+
+  /**
+   * Raw public API bodies. Separate from the telemetry bucket so this data
+   * and operator uploads are not mixed, and so the fetch role never receives
+   * permission to read uploads. `raw/` expires after 30 days. `cache/` stays.
+   */
+  private rawResponsesBucket(): s3.Bucket {
+    return new s3.Bucket(this, 'ExternalRawBucket', {
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      enforceSSL: true,
+      versioned: true,
+      objectOwnership: s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
+      lifecycleRules: [
+        {
+          prefix: 'raw/',
+          expiration: cdk.Duration.days(30),
+        },
+        {
+          abortIncompleteMultipartUploadAfter: cdk.Duration.days(7),
+        },
+      ],
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+  }
+
+  /**
+   * The value is generated on first create. Put the real NASA key in with
+   * `put-secret-value` after deploy. Later deploys do not rotate it.
+   */
+  private nasaSecret(): secretsmanager.Secret {
+    return new secretsmanager.Secret(this, 'NasaDonkiApiKey', {
+      description: 'NASA API key for the hourly DONKI fetch. Replace the generated value after the first deploy.',
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+  }
+
+  /**
+   * Hourly fetch. The role can read the NASA secret, scan Satellites for
+   * catalog numbers, and write space-weather and TLE rows. It can get and put
+   * objects under raw/ and cache/ in the external bucket only.
+   */
+  private hourlyExternalFetch(resources: {
+    rawResponses: s3.Bucket;
+    nasaSecret: secretsmanager.Secret;
+    satellites: dynamodb.Table;
+    spaceWeather: dynamodb.Table;
+    tleCache: dynamodb.Table;
+  }): void {
+    const backendSrc = path.resolve(__dirname, '../../backend/src');
+    const fetchFn = new lambda.Function(this, 'ExternalFetch', {
+      description: 'Hourly fetch of DONKI, NOAA SWPC, and CelesTrak into S3 and DynamoDB.',
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'handler.handler',
+      code: lambda.Code.fromAsset(backendSrc, {
+        exclude: ['**/__pycache__/**', '**/*.pyc'],
+      }),
+      timeout: cdk.Duration.minutes(5),
+      memorySize: 256,
+      logGroup: new logs.LogGroup(this, 'ExternalFetchLogs', {
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+      environment: {
+        RAW_BUCKET_NAME: resources.rawResponses.bucketName,
+        SPACE_WEATHER_TABLE_NAME: resources.spaceWeather.tableName,
+        TLE_TABLE_NAME: resources.tleCache.tableName,
+        SATELLITES_TABLE_NAME: resources.satellites.tableName,
+        NASA_SECRET_ARN: resources.nasaSecret.secretArn,
+        DONKI_LOOKBACK_DAYS: '7',
+      },
+    });
+
+    fetchFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadWriteExternalRaw',
+      actions: ['s3:GetObject', 's3:PutObject'],
+      resources: [
+        resources.rawResponses.arnForObjects('raw/*'),
+        resources.rawResponses.arnForObjects('cache/*'),
+      ],
+    }));
+    fetchFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'WriteSpaceWeatherAndTle',
+      actions: ['dynamodb:PutItem', 'dynamodb:BatchWriteItem'],
+      resources: [resources.spaceWeather.tableArn, resources.tleCache.tableArn],
+    }));
+    fetchFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ListTrackedSatellites',
+      actions: ['dynamodb:Scan'],
+      resources: [resources.satellites.tableArn],
+    }));
+    resources.nasaSecret.grantRead(fetchFn);
+
+    new events.Rule(this, 'HourlyExternalFetch', {
+      description: 'Fetch space weather and TLEs every hour.',
+      schedule: events.Schedule.rate(cdk.Duration.hours(1)),
+      targets: [new targets.LambdaFunction(fetchFn)],
+    });
   }
 }
 
