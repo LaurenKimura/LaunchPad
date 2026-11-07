@@ -79,6 +79,8 @@ describe("anomaly detail", () => {
     expect(screen.getByRole("row", { name: /radiation 85/i })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Radiation" })).toBeInTheDocument();
     expect(screen.getByText("SEP 2026-SEP-1 covers the entire gap.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Download JSON" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Download PDF" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /anomaly/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /eclipse/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /sep 2026-sep-1/i })).toBeInTheDocument();
@@ -95,6 +97,10 @@ describe("anomaly detail", () => {
     expect(screen.getByRole("link", { name: /back to dashboard/i })).toHaveFocus();
     await userEvent.tab();
     expect(screen.getByRole("link", { name: /3d globe/i })).toHaveFocus();
+    await userEvent.tab();
+    expect(screen.getByRole("button", { name: "Download JSON" })).toHaveFocus();
+    await userEvent.tab();
+    expect(screen.getByRole("button", { name: "Download PDF" })).toHaveFocus();
     await userEvent.tab();
     expect(anomaly).toHaveFocus();
     await userEvent.keyboard("{Enter}");

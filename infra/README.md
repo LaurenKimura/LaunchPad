@@ -18,6 +18,8 @@ This stack creates:
 
 `POST /anomalies/{anomalyId}/explain` sends the stored scores and evidence to Claude on Bedrock. The model does not compute scores. Each operator gets 20 calls per UTC day. The fetch Lambda cannot read the telemetry bucket. The correlation Lambda cannot read the uploads bucket. The explain Lambda cannot read S3.
 
+The API and the uploads bucket allow one browser origin: `https://main.<Amplify default domain>`. Each Lambda has a CloudWatch alarm on the Errors metric. The alarms publish to one SNS topic. Subscribe an email with the command in the root README.
+
 Account and region come from your AWS CLI configuration. No account id, region, or secret is stored in the repo.
 
 ## Deploy

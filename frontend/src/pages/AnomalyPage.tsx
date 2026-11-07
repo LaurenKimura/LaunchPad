@@ -4,6 +4,7 @@ import { askAnomaly, explainAnomaly, getAnomaly } from "../api";
 import { AnomalyTimeline } from "../components/AnomalyTimeline";
 import { CauseChart } from "../components/CauseChart";
 import { ExplanationPanel } from "../components/ExplanationPanel";
+import { ReportExport } from "../components/ReportExport";
 import { SpaceWeatherPanel } from "../components/SpaceWeatherPanel";
 import { CAUSE_LABELS, type AnomalyDetail } from "../types";
 import { useAuth } from "../useAuth";
@@ -43,9 +44,12 @@ export function AnomalyPage() {
       </Link>
       <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
         <h1 className="text-2xl font-medium text-slate-50">Anomaly {anomalyId}</h1>
-        <Link className="text-sm text-cyan-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-300" to={`/anomalies/${anomalyId}/globe`}>
-          3D globe
-        </Link>
+        <div className="flex flex-wrap items-center gap-2">
+          <Link className="text-sm text-cyan-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-300" to={`/anomalies/${anomalyId}/globe`}>
+            3D globe
+          </Link>
+          {detail && <ReportExport detail={detail} />}
+        </div>
       </div>
       {error && (
         <p className="mt-4 rounded-md border border-rose-800 bg-rose-950 px-3 py-2 text-sm text-rose-100" role="alert">

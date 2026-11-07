@@ -61,6 +61,21 @@ export type AnomalyDetail = {
   };
 };
 
+export type AnomalyReport = {
+  title: "LaunchPad anomaly report";
+  exportedAt: string;
+  disclaimer: string;
+  anomaly: Anomaly;
+  scores: Array<CauseScore & { label: string }>;
+  timeline: {
+    eclipseStatus: AnomalyDetail["timeline"]["eclipseStatus"];
+    events: TimelineEvent[];
+    eclipses: TimeSpan[];
+  };
+  spaceWeather: AnomalyDetail["spaceWeather"];
+  southAtlanticAnomaly: SaaBox;
+};
+
 export type Explanation = {
   summary?: string;
   fixes?: string[];

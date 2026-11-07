@@ -2,7 +2,10 @@ import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib/core';
+import * as amplify from 'aws-cdk-lib/aws-amplify';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as events from 'aws-cdk-lib/aws-events';
@@ -12,6 +15,7 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import * as sns from 'aws-cdk-lib/aws-sns';
 import { Construct } from 'constructs';
 
 /**
@@ -24,11 +28,15 @@ import { Construct } from 'constructs';
  * on Bedrock to explain those stored scores. Claude does not compute them.
  */
 export class LaunchpadStack extends cdk.Stack {
+  private errorTopic?: sns.Topic;
+
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
     const operators = this.operatorUserPool();
-    const uploads = this.uploadsBucket();
+    const web = this.hostingApp();
+    const webOrigin = `https://main.${web.attrDefaultDomain}`;
+    const uploads = this.uploadsBucket(webOrigin);
 
     const satellites = this.satellitesTable();
     const uploadRecords = this.uploadsTable();
@@ -50,7 +58,9 @@ export class LaunchpadStack extends cdk.Stack {
       spaceWeather,
       tleCache,
       explainUsage,
+      webOrigin,
     });
+    this.hostingBranch(web, operators.pool.userPoolId, operators.client.userPoolClientId, uploadApi.url);
 
     new cdk.CfnOutput(this, 'UserPoolId', {
       value: operators.pool.userPoolId,
@@ -81,6 +91,14 @@ export class LaunchpadStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'UploadApiUrl', {
       value: uploadApi.url,
       description: 'API base URL. Send a Cognito ID token on /satellites, /anomalies, and /uploads.',
+    });
+    new cdk.CfnOutput(this, 'AmplifyAppId', {
+      value: web.attrAppId,
+      description: 'Amplify app. Connect the GitHub repository in the Amplify console.',
+    });
+    new cdk.CfnOutput(this, 'WebOrigin', {
+      value: webOrigin,
+      description: 'Only browser origin allowed to call the API and upload to S3.',
     });
   }
 
@@ -129,7 +147,7 @@ export class LaunchpadStack extends cdk.Stack {
    * copy if an upload is overwritten. Object-created events are published so
    * the parser can run. The bucket is retained on stack delete.
    */
-  private uploadsBucket(): s3.Bucket {
+  private uploadsBucket(origin: string): s3.Bucket {
     return new s3.Bucket(this, 'UploadsBucket', {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
@@ -140,7 +158,7 @@ export class LaunchpadStack extends cdk.Stack {
       cors: [
         {
           allowedMethods: [s3.HttpMethods.POST, s3.HttpMethods.PUT, s3.HttpMethods.HEAD],
-          allowedOrigins: ['*'],
+          allowedOrigins: [origin],
           allowedHeaders: ['*'],
           exposedHeaders: ['ETag'],
           maxAge: 3000,
@@ -360,6 +378,7 @@ export class LaunchpadStack extends cdk.Stack {
         DONKI_LOOKBACK_DAYS: '7',
       },
     });
+    this.watchErrors(fetchFn, 'ExternalFetch');
 
     fetchFn.addToRolePolicy(new iam.PolicyStatement({
       sid: 'ReadWriteExternalRaw',
@@ -404,6 +423,7 @@ export class LaunchpadStack extends cdk.Stack {
     spaceWeather: dynamodb.Table;
     tleCache: dynamodb.Table;
     explainUsage: dynamodb.Table;
+    webOrigin: string;
   }): apigateway.RestApi {
     const backendSrc = path.resolve(__dirname, '../../backend/src');
     const code = lambda.Code.fromAsset(backendSrc, {
@@ -428,6 +448,7 @@ export class LaunchpadStack extends cdk.Stack {
         PRESIGN_EXPIRES_SECONDS: '900',
       },
     });
+    this.watchErrors(presignFn, 'PresignUpload');
     const scoredCode = correlateAsset();
     const correlateFn = new lambda.Function(this, 'CorrelateGaps', {
       description: 'Scores each anomaly window from TLE propagation and space weather.',
@@ -447,6 +468,7 @@ export class LaunchpadStack extends cdk.Stack {
         TLE_TABLE_NAME: resources.tleCache.tableName,
       },
     });
+    this.watchErrors(correlateFn, 'CorrelateGaps');
     const parserFn = new lambda.Function(this, 'ParseUpload', {
       description: 'Validates an uploaded telemetry file and records gap windows.',
       runtime: lambda.Runtime.PYTHON_3_12,
@@ -468,6 +490,7 @@ export class LaunchpadStack extends cdk.Stack {
         CORRELATE_FUNCTION_NAME: correlateFn.functionName,
       },
     });
+    this.watchErrors(parserFn, 'ParseUpload');
 
     presignFn.addToRolePolicy(new iam.PolicyStatement({
       sid: 'SignTelemetryUpload',
@@ -536,6 +559,7 @@ export class LaunchpadStack extends cdk.Stack {
         TLE_TABLE_NAME: resources.tleCache.tableName,
       },
     });
+    this.watchErrors(readFn, 'ReadApi');
     readFn.addToRolePolicy(new iam.PolicyStatement({
       sid: 'ListOwnedSatellites',
       actions: ['dynamodb:Query', 'dynamodb:GetItem'],
@@ -564,7 +588,7 @@ export class LaunchpadStack extends cdk.Stack {
       restApiName: 'launchpad-uploads',
       description: 'Operator API for satellites, anomalies, and presigned uploads.',
       defaultCorsPreflightOptions: {
-        allowOrigins: apigateway.Cors.ALL_ORIGINS,
+        allowOrigins: [resources.webOrigin],
         allowMethods: ['GET', 'POST', 'OPTIONS'],
         allowHeaders: ['Authorization', 'Content-Type'],
       },
@@ -603,6 +627,7 @@ export class LaunchpadStack extends cdk.Stack {
         BEDROCK_DAILY_LIMIT: '20',
       },
     });
+    this.watchErrors(explainFn, 'ExplainAnomaly');
     explainFn.addToRolePolicy(new iam.PolicyStatement({
       sid: 'ReadOwnedAnomaly',
       actions: ['dynamodb:GetItem'],
@@ -659,6 +684,91 @@ export class LaunchpadStack extends cdk.Stack {
       targets: [new targets.LambdaFunction(parserFn, { retryAttempts: 2 })],
     });
     return api;
+  }
+
+  /**
+   * Static hosting for the web app. The Git repository is connected in the
+   * Amplify console so this stack does not store a GitHub token. API CORS and
+   * the uploads bucket allow only https://main.<default domain>.
+   */
+  private hostingApp(): amplify.CfnApp {
+    const role = new iam.Role(this, 'AmplifyServiceRole', {
+      assumedBy: new iam.ServicePrincipal('amplify.amazonaws.com'),
+      description: 'Lets Amplify Hosting write its build logs.',
+    });
+    role.addToPolicy(new iam.PolicyStatement({
+      sid: 'WriteAmplifyBuildLogs',
+      actions: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents'],
+      resources: [`arn:aws:logs:${this.region}:${this.account}:log-group:/aws/amplify/*`],
+    }));
+    return new amplify.CfnApp(this, 'WebApp', {
+      name: 'launchpad',
+      platform: 'WEB',
+      iamServiceRole: role.roleArn,
+      description: 'LaunchPad operator dashboard.',
+      buildSpec: [
+        'version: 1',
+        'frontend:',
+        '  phases:',
+        '    preBuild:',
+        '      commands:',
+        '        - npm ci --prefix frontend',
+        '    build:',
+        '      commands:',
+        '        - npm run build --prefix frontend',
+        '  artifacts:',
+        '    baseDirectory: frontend/dist',
+        '    files:',
+        "      - '**/*'",
+        '  cache:',
+        '    paths:',
+        '      - frontend/node_modules/**/*',
+      ].join('\n'),
+      customRules: [
+        {
+          source: '</^[^.]+$|\\.(?!(css|gif|ico|jpg|js|png|txt|svg|woff|woff2|ttf|map|json|webp)$)([^.]+$)/>',
+          target: '/index.html',
+          status: '200',
+        },
+      ],
+    });
+  }
+
+  private hostingBranch(app: amplify.CfnApp, userPoolId: string, clientId: string, apiUrl: string): void {
+    new amplify.CfnBranch(this, 'WebBranch', {
+      appId: app.attrAppId,
+      branchName: 'main',
+      stage: 'PRODUCTION',
+      framework: 'React',
+      enableAutoBuild: true,
+      environmentVariables: [
+        { name: 'VITE_USER_POOL_ID', value: userPoolId },
+        { name: 'VITE_USER_POOL_CLIENT_ID', value: clientId },
+        { name: 'VITE_API_URL', value: apiUrl },
+      ],
+    });
+  }
+
+  /** One alarm per function. Missing data is not an error. The topic has no subscription until an operator adds one. */
+  private watchErrors(fn: lambda.Function, id: string): void {
+    if (!this.errorTopic) {
+      this.errorTopic = new sns.Topic(this, 'LambdaErrorTopic', {
+        displayName: 'LaunchPad Lambda errors',
+      });
+      new cdk.CfnOutput(this, 'LambdaErrorTopicArn', {
+        value: this.errorTopic.topicArn,
+        description: 'Subscribe an email to hear about Lambda errors.',
+      });
+    }
+    const alarm = new cloudwatch.Alarm(this, `${id}Errors`, {
+      alarmDescription: `${id} reported at least one error in five minutes.`,
+      metric: fn.metricErrors({ period: cdk.Duration.minutes(5), statistic: 'Sum' }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+    alarm.addAlarmAction(new cloudwatchActions.SnsAction(this.errorTopic));
   }
 }
 

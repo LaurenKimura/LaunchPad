@@ -317,3 +317,41 @@ test('upload API signs a post and the parser reads only the uploads prefix', () 
   expect(posts).toHaveLength(2);
   expect(posts.every((method) => method.Properties.AuthorizationType === 'COGNITO_USER_POOLS')).toBe(true);
 });
+
+test('lambda errors alarm and browsers are limited to the Amplify origin', () => {
+  const synthesized = template();
+  synthesized.resourceCountIs('AWS::CloudWatch::Alarm', 6);
+  synthesized.resourceCountIs('AWS::SNS::Topic', 1);
+  synthesized.hasResourceProperties('AWS::CloudWatch::Alarm', {
+    MetricName: 'Errors',
+    Namespace: 'AWS/Lambda',
+    Threshold: 1,
+    ComparisonOperator: 'GreaterThanOrEqualToThreshold',
+    TreatMissingData: 'notBreaching',
+    EvaluationPeriods: 1,
+  });
+  const alarms = Object.values(synthesized.findResources('AWS::CloudWatch::Alarm')) as Array<{
+    Properties: { AlarmActions?: string[] };
+  }>;
+  expect(alarms.every((alarm) => (alarm.Properties.AlarmActions ?? []).length === 1)).toBe(true);
+
+  synthesized.hasResourceProperties('AWS::Amplify::App', {
+    Name: 'launchpad',
+    Platform: 'WEB',
+  });
+  synthesized.hasResourceProperties('AWS::Amplify::Branch', {
+    BranchName: 'main',
+    Stage: 'PRODUCTION',
+  });
+
+  const buckets = synthesized.findResources('AWS::S3::Bucket');
+  const corsBuckets = Object.values(buckets).filter((bucket) => bucket.Properties.CorsConfiguration);
+  expect(corsBuckets).toHaveLength(1);
+  const origins = JSON.stringify(corsBuckets[0].Properties.CorsConfiguration.CorsRules[0].AllowedOrigins);
+  expect(origins).toContain('https://main.');
+  expect(origins).not.toContain('*');
+
+  const methods = JSON.stringify(synthesized.findResources('AWS::ApiGateway::Method'));
+  expect(methods).toContain('https://main.');
+  expect(methods).not.toContain("'*'");
+});
