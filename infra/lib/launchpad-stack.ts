@@ -1,3 +1,5 @@
+import { execFileSync } from 'node:child_process';
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib/core';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
@@ -18,7 +20,7 @@ import { Construct } from 'constructs';
  * Operators sign in with email. Telemetry files land in a private encrypted
  * bucket. An hourly Lambda archives public space-weather and TLE responses.
  * Operators request a presigned upload, and a parser records gap windows.
- * Scoring and Bedrock are not part of this stack.
+ * A correlation Lambda scores each window. Bedrock is not part of this stack.
  */
 export class LaunchpadStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -42,6 +44,9 @@ export class LaunchpadStack extends cdk.Stack {
       satellites,
       uploadRecords,
       anomalies,
+      causeScores,
+      spaceWeather,
+      tleCache,
     });
 
     new cdk.CfnOutput(this, 'UserPoolId', {
@@ -196,12 +201,20 @@ export class LaunchpadStack extends cdk.Stack {
    * Sort key startTimeAnomalyId is `{ISO-8601 start}#{anomalyId}`.
    * Query uploadId for the timeline, in time order.
    * Query GSI byAnomalyId to open one anomaly.
+   * Query GSI bySatellite (satelliteId, startTimeAnomalyId) for recent gaps
+   * when the software score looks for a repeating pattern.
    */
   private anomaliesTable(): dynamodb.Table {
     const table = diagnosticTable(this, 'Anomalies', 'uploadId', 'startTimeAnomalyId');
     table.addGlobalSecondaryIndex({
       indexName: 'byAnomalyId',
       partitionKey: stringAttr('anomalyId'),
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+    table.addGlobalSecondaryIndex({
+      indexName: 'bySatellite',
+      partitionKey: stringAttr('satelliteId'),
+      sortKey: stringAttr('startTimeAnomalyId'),
       projectionType: dynamodb.ProjectionType.ALL,
     });
     return table;
@@ -211,8 +224,9 @@ export class LaunchpadStack extends cdk.Stack {
    * One item per cause. A score is 0-100 and stands on its own; rows are never
    * resized so the set sums to 100.
    *
-   * Query anomalyId to read every cause for one gap. Sort key causeId is the
-   * cause name, so one anomaly has at most one row per cause.
+   * Query anomalyId to read every cause for one gap. Sort key causeId is one of
+   * radiation, eclipse_power, geomagnetic, or software_system, so one anomaly
+   * has at most one row per cause.
    * Query GSI byUpload (uploadId, anomalyIdCauseId) to load every score for
    * an upload. anomalyIdCauseId is `{anomalyId}#{causeId}`.
    */
@@ -366,6 +380,9 @@ export class LaunchpadStack extends cdk.Stack {
     satellites: dynamodb.Table;
     uploadRecords: dynamodb.Table;
     anomalies: dynamodb.Table;
+    causeScores: dynamodb.Table;
+    spaceWeather: dynamodb.Table;
+    tleCache: dynamodb.Table;
   }): apigateway.RestApi {
     const backendSrc = path.resolve(__dirname, '../../backend/src');
     const code = lambda.Code.fromAsset(backendSrc, {
@@ -390,6 +407,24 @@ export class LaunchpadStack extends cdk.Stack {
         PRESIGN_EXPIRES_SECONDS: '900',
       },
     });
+    const correlateFn = new lambda.Function(this, 'CorrelateGaps', {
+      description: 'Scores each anomaly window from TLE propagation and space weather.',
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'correlate.handler',
+      code: correlateAsset(),
+      timeout: cdk.Duration.seconds(120),
+      memorySize: 512,
+      logGroup: new logs.LogGroup(this, 'CorrelateGapsLogs', {
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+      environment: {
+        ANOMALIES_TABLE_NAME: resources.anomalies.tableName,
+        CAUSE_SCORES_TABLE_NAME: resources.causeScores.tableName,
+        SPACE_WEATHER_TABLE_NAME: resources.spaceWeather.tableName,
+        TLE_TABLE_NAME: resources.tleCache.tableName,
+      },
+    });
     const parserFn = new lambda.Function(this, 'ParseUpload', {
       description: 'Validates an uploaded telemetry file and records gap windows.',
       runtime: lambda.Runtime.PYTHON_3_12,
@@ -408,6 +443,7 @@ export class LaunchpadStack extends cdk.Stack {
         MAX_UPLOAD_BYTES: '5242880',
         MAX_UPLOAD_ROWS: '100000',
         GAP_INTERVAL_MULTIPLIER: '2',
+        CORRELATE_FUNCTION_NAME: correlateFn.functionName,
       },
     });
 
@@ -441,6 +477,22 @@ export class LaunchpadStack extends cdk.Stack {
       sid: 'WriteAnomalyWindows',
       actions: ['dynamodb:PutItem', 'dynamodb:BatchWriteItem'],
       resources: [resources.anomalies.tableArn],
+    }));
+    correlateFn.grantInvoke(parserFn);
+    correlateFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadAnomalyWindows',
+      actions: ['dynamodb:Query'],
+      resources: [resources.anomalies.tableArn, `${resources.anomalies.tableArn}/index/bySatellite`],
+    }));
+    correlateFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadSpaceWeatherAndTle',
+      actions: ['dynamodb:Query'],
+      resources: [resources.spaceWeather.tableArn, resources.tleCache.tableArn],
+    }));
+    correlateFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'WriteCauseScores',
+      actions: ['dynamodb:PutItem', 'dynamodb:BatchWriteItem'],
+      resources: [resources.causeScores.tableArn],
     }));
 
     const api = new apigateway.RestApi(this, 'UploadApi', {
@@ -482,6 +534,43 @@ export class LaunchpadStack extends cdk.Stack {
     });
     return api;
   }
+}
+
+/**
+ * The correlate function needs sgp4, which the Lambda runtime does not ship.
+ * Local bundling installs that one package and copies the Python sources on
+ * top, so synth does not need Docker.
+ */
+function correlateAsset(): lambda.Code {
+  const backendSrc = path.resolve(__dirname, '../../backend/src');
+  return lambda.Code.fromAsset(backendSrc, {
+    exclude: ['**/__pycache__/**', '**/*.pyc'],
+    bundling: {
+      image: lambda.Runtime.PYTHON_3_12.bundlingImage,
+      command: [
+        'bash',
+        '-c',
+        'python3 -m pip install --no-cache-dir sgp4==2.23 -t /asset-output && cp -au /asset-input/. /asset-output',
+      ],
+      local: {
+        tryBundle(outputDir: string): boolean {
+          execFileSync('python3', ['-m', 'pip', 'install', '--no-cache-dir', 'sgp4==2.23', '-t', outputDir], {
+            stdio: 'inherit',
+          });
+          for (const entry of fs.readdirSync(backendSrc)) {
+            if (entry === '__pycache__' || entry.endsWith('.pyc')) {
+              continue;
+            }
+            fs.cpSync(path.join(backendSrc, entry), path.join(outputDir, entry), {
+              recursive: true,
+              filter: (source) => !source.includes('__pycache__') && !source.endsWith('.pyc'),
+            });
+          }
+          return true;
+        },
+      },
+    },
+  });
 }
 
 function stringAttr(name: string): dynamodb.Attribute {

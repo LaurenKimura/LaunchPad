@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-from parse_upload import ParserDeps, parse_event
+from parse_upload import ParserDeps, correlation_payload, parse_event
 
 SAMPLES = Path(__file__).resolve().parents[2] / "samples" / "telemetry"
 NOW = datetime(2026, 3, 1, 12, 0, tzinfo=timezone.utc)
@@ -133,6 +133,45 @@ def test_missing_upload_row_does_not_read_the_object():
     result = parse_event(event(size=20), parser)
     assert result["error"] == "upload_not_found"
     assert objects.reads == []
+
+
+def test_a_gap_requests_correlation_with_ids_only():
+    body = (SAMPLES / "one-gap.csv").read_bytes()
+    seen = []
+    parser = deps(body)
+    parser.request_correlation = lambda upload_id, satellite_id: seen.append((upload_id, satellite_id))
+    result = parse_event(event(size=len(body)), parser)
+    assert result["gaps"] == 1
+    assert seen == [(UPLOAD_ID, "iss")]
+    assert correlation_payload("u", "iss") == {"uploadId": "u", "satelliteId": "iss"}
+
+
+def test_steady_file_does_not_request_correlation():
+    body = (SAMPLES / "steady.csv").read_bytes()
+    seen = []
+    parser = deps(body)
+    parser.request_correlation = lambda upload_id, satellite_id: seen.append(upload_id)
+    parse_event(event(size=len(body)), parser)
+    assert seen == []
+
+
+def test_correlation_failure_leaves_the_upload_pending():
+    body = (SAMPLES / "one-gap.csv").read_bytes()
+    uploads = Uploads()
+    parser = deps(body, uploads=uploads)
+
+    def fail(upload_id, satellite_id):
+        del upload_id, satellite_id
+        raise RuntimeError("invoke_failed")
+
+    parser.request_correlation = fail
+    try:
+        parse_event(event(size=len(body)), parser)
+    except RuntimeError as exc:
+        assert str(exc) == "invoke_failed"
+    else:
+        raise AssertionError("expected the invoke error to propagate")
+    assert uploads.parsed == []
 
 
 def test_encoded_key_is_accepted():

@@ -151,8 +151,8 @@ class SatelliteDirectory:
             kwargs["ExclusiveStartKey"] = last_key
 
 
-def _attribute_map(item: dict[str, Any]) -> dict[str, dict[str, str]]:
-    mapped: dict[str, dict[str, str]] = {}
+def _attribute_map(item: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    mapped: dict[str, dict[str, Any]] = {}
     for key, value in item.items():
         encoded = _attribute_value(value)
         if encoded is not None:
@@ -160,7 +160,7 @@ def _attribute_map(item: dict[str, Any]) -> dict[str, dict[str, str]]:
     return mapped
 
 
-def _attribute_value(value: Any) -> dict[str, str] | None:
+def _attribute_value(value: Any) -> dict[str, Any] | None:
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, str):
@@ -171,6 +171,9 @@ def _attribute_value(value: Any) -> dict[str, str] | None:
         return {"N": format(value, "f")}
     if isinstance(value, int):
         return {"N": str(value)}
+    if isinstance(value, list):
+        encoded = [child for item in value if (child := _attribute_value(item)) is not None]
+        return {"L": encoded}
     raise StoreError("unsupported_attribute")
 
 

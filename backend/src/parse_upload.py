@@ -8,6 +8,7 @@ Raw file bytes are never logged.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ class ParserDeps:
     max_bytes: int
     max_rows: int
     multiplier: float
+    request_correlation: Callable[[str, str], None] | None = None
 
 
 def handler(event: dict[str, Any] | None, context: object) -> dict[str, Any]:
@@ -79,6 +81,8 @@ def parse_event(event: dict[str, Any], deps: ParserDeps) -> dict[str, Any]:
     )
     if items:
         deps.anomalies.put_all(items)
+        if deps.request_correlation is not None:
+            deps.request_correlation(upload_id, satellite_id)
     try:
         deps.uploads.mark_parsed(
             satellite_id,
@@ -110,6 +114,18 @@ def deps_from_env() -> ParserDeps:
 
     s3 = boto3.client("s3")
     dynamodb = boto3.client("dynamodb")
+    function_name = os.environ.get("CORRELATE_FUNCTION_NAME", "").strip()
+    request = None
+    if function_name:
+        functions = boto3.client("lambda")
+
+        def request(upload_id: str, satellite_id: str) -> None:
+            functions.invoke(
+                FunctionName=function_name,
+                InvocationType="Event",
+                Payload=json.dumps(correlation_payload(upload_id, satellite_id)).encode(),
+            )
+
     return ParserDeps(
         objects=ObjectReader(s3),
         uploads=UploadDirectory(dynamodb, _required("UPLOADS_TABLE_NAME")),
@@ -119,7 +135,14 @@ def deps_from_env() -> ParserDeps:
         max_bytes=max_upload_bytes(),
         max_rows=max_upload_rows(),
         multiplier=gap_multiplier(),
+        request_correlation=request,
     )
+
+
+def correlation_payload(upload_id: str, satellite_id: str) -> dict[str, str]:
+    """Ids only. The correlation function reads the gap from DynamoDB."""
+
+    return {"uploadId": upload_id, "satelliteId": satellite_id}
 
 
 def _locate(

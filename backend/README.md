@@ -2,7 +2,7 @@
 
 Python Lambdas for the dashboard. The CDK app in `infra/` deploys them.
 
-`handler.handler` collects space weather and TLEs every hour. `presign.handler` returns a presigned upload. `parse_upload.handler` reads that file and records gap windows. Neither path logs raw telemetry or a presigned URL.
+`handler.handler` collects space weather and TLEs every hour. `presign.handler` returns a presigned upload. `parse_upload.handler` reads that file and records gap windows. `correlate.handler` scores each window. None of these paths log raw telemetry or a presigned URL.
 
 ## Sources
 
@@ -41,6 +41,12 @@ TLE rows use `satelliteId` and the element-set epoch. The epoch is taken from co
 The parser accepts CSV or JSON. A timestamp may carry a zone offset. A timestamp with no zone is read as UTC. A gap is two neighboring samples more than `GAP_INTERVAL_MULTIPLIER` times the median positive interval apart. The default multiplier is 2. Each gap becomes one Anomalies item. The window starts at the sample before the hole and ends at the sample after it.
 
 Sample files are in [`samples/`](../samples/README.md). The unit tests load those files.
+
+## Scores
+
+`scoring.py` has one pure function per cause. Weights are in [`src/scoring_weights.json`](src/scoring_weights.json). `propagate.py` uses SGP4 for position, the configured South Atlantic Anomaly box, and a cylindrical Earth shadow. `correlate.handler` reads DynamoDB and writes four CauseScores rows. A gap fully inside a SEP scores `radiation.sep_full_overlap` (85 in the shipped file) and does not pull the other scores down.
+
+`pip install -r requirements-dev.txt` installs `sgp4` for the tests. The CDK app installs the same version into the correlation Lambda asset.
 
 ## Tests
 

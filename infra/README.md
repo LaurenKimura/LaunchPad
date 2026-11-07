@@ -13,8 +13,9 @@ This stack creates:
 - An hourly Lambda, started by EventBridge, that archives those responses and writes normalized rows
 - `POST /uploads` on API Gateway. A signed-in operator receives a presigned POST for one CSV or JSON file
 - A parser Lambda, started by the S3 object-created event, that records gap windows on the Anomalies table
+- A correlation Lambda that scores each window. The four scores are independent 0–100 values
 
-Scoring code and Bedrock are not in this stack yet. The fetch Lambda cannot read the telemetry bucket.
+Bedrock is not in this stack. The fetch Lambda cannot read the telemetry bucket. The correlation Lambda cannot read the uploads bucket.
 
 Account and region come from your AWS CLI configuration. No account id, region, or secret is stored in the repo.
 
@@ -111,6 +112,7 @@ Time-ordered sort keys use ISO-8601 UTC strings. `{timestamp}#{id}` still sorts 
 
 - **Timeline for one file.** Query `uploadId`. Rows come back in start-time order.
 - **Open one anomaly.** Query index `byAnomalyId`: partition key `anomalyId`.
+- **Recent gaps for one satellite.** Query index `bySatellite`: partition key `satelliteId`, sort key `startTimeAnomalyId`. The software score uses this to look for a repeating pattern.
 
 ### CauseScores
 
@@ -119,7 +121,7 @@ Time-ordered sort keys use ISO-8601 UTC strings. `{timestamp}#{id}` still sorts 
 | Partition key | `anomalyId` |
 | Sort key | `causeId` |
 
-One row per cause. Each row holds its own 0–100 likelihood. Nothing in the table combines those numbers into a share of 100.
+One row per cause (`radiation`, `eclipse_power`, `geomagnetic`, `software_system`). Each row holds its own 0–100 likelihood. Nothing in the table combines those numbers into a share of 100.
 
 - **Scores for one gap.** Query `anomalyId`. The sort key is the cause name, so a gap has one row per cause.
 - **Every score on an upload.** Query index `byUpload`: partition key `uploadId`, sort key `anomalyIdCauseId` = `{anomalyId}#{causeId}`.
@@ -192,13 +194,33 @@ When the object is created, EventBridge invokes the parser. The parser:
 - converts each timestamp to UTC (an offset is honored; a timestamp with no zone is read as UTC)
 - flags a gap when two neighboring samples are more than `GAP_INTERVAL_MULTIPLIER` times the median positive interval apart (default 2)
 - writes one Anomalies row per gap window and sets the upload status to `parsed` or `rejected`
+- asks the correlation Lambda to score the upload when at least one gap was saved. The message contains the upload id and satellite id
 
-A bad file is a finished result, not a retry. An S3 or DynamoDB error is retried twice. Logs contain the upload id, the sample count, the gap count, and an error code. They do not contain the file body or the presigned URL.
+A bad file is a finished result, not a retry. An S3 or DynamoDB error is retried twice. If the correlation invoke fails, the upload stays `pending` so the event can be tried again. Logs contain the upload id, the sample count, the gap count, and an error code. They do not contain the file body or the presigned URL.
 
 The presign role can `s3:PutObject` on `uploads/*`, `dynamodb:GetItem` on Satellites, and `dynamodb:PutItem` on Uploads. The parser role can `s3:GetObject` on `uploads/*`, get and update Uploads, and put Anomalies rows. Neither role can delete an object.
 
 Sample files and the expected gap windows are in [`samples/README.md`](../samples/README.md).
 
+## Correlation
+
+After a file parses, the correlation Lambda loads that upload's anomaly windows, the cached TLE with `epoch` at or before the gap, and space-weather rows from the lookback in `scoring_weights.json`. It propagates the TLE with SGP4, then writes four CauseScores rows:
+
+| causeId | What raises the score |
+|---|---|
+| `radiation` | SEP, >=10 MeV proton flux, flare class, CME overlap, and time inside the South Atlantic Anomaly box |
+| `eclipse_power` | Fraction of propagated samples in Earth shadow |
+| `geomagnetic` | Kp, and a GST that overlaps the gap |
+| `software_system` | Other gaps on the same satellite with a similar duration or a regular spacing. No space weather and no orbit |
+
+Each score is clamped to 0–100 on its own. They are not rescaled to sum to 100. Weights live in [`backend/src/scoring_weights.json`](../backend/src/scoring_weights.json). Every row includes the evidence lines and the disclaimer that these are estimates, not confirmed root causes.
+
+A gap that sits fully inside a SEP association window scores high on radiation (the `sep_full_overlap` weight, 85 with the shipped config) even when the other three scores are zero.
+
+The correlation role can query Anomalies (including `bySatellite`), SpaceWeatherEvents, and TLECache, and can write CauseScores. It cannot read S3 or the NASA secret. Logs contain ids and the four numbers, not evidence text and not telemetry.
+
+`cdk synth` installs `sgp4==2.23` with the local `python3`. That interpreter needs to be 3.12 so the wheel matches the Lambda runtime.
+
 ## What this stack does not do
 
-It does not score anomalies or call Bedrock. Do not log raw telemetry.
+It does not call Bedrock. Do not log raw telemetry.

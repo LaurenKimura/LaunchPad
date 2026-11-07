@@ -105,6 +105,7 @@ test('diagnostic tables are on-demand with the keys each access pattern needs', 
   expect(keysOf(tables, 'Anomalies')).toEqual(['uploadId', 'startTimeAnomalyId']);
   expect(indexesOf(tables, 'Anomalies')).toEqual({
     byAnomalyId: ['anomalyId'],
+    bySatellite: ['satelliteId', 'startTimeAnomalyId'],
   });
 
   expect(keysOf(tables, 'CauseScores')).toEqual(['anomalyId', 'causeId']);
@@ -254,4 +255,23 @@ test('upload API signs a post and the parser reads only the uploads prefix', () 
   expect(parser).not.toContain('s3:PutObject');
   expect(presign).toContain('uploads/*');
   expect(parser).toContain('uploads/*');
+  expect(parser).toContain('lambda:InvokeFunction');
+
+  synthesized.hasResourceProperties('AWS::Lambda::Function', {
+    Handler: 'correlate.handler',
+    Timeout: 120,
+    MemorySize: 512,
+    Environment: {
+      Variables: Match.objectLike({
+        CAUSE_SCORES_TABLE_NAME: Match.anyValue(),
+        TLE_TABLE_NAME: Match.anyValue(),
+      }),
+    },
+  });
+  const correlate = JSON.stringify(Object.entries(policies).find(([id]) => id.startsWith('CorrelateGaps'))?.[1]);
+  expect(correlate).toContain('dynamodb:Query');
+  expect(correlate).toContain('bySatellite');
+  expect(correlate).toContain('dynamodb:BatchWriteItem');
+  expect(correlate).not.toContain('s3:GetObject');
+  expect(correlate).not.toContain('secretsmanager:GetSecretValue');
 });

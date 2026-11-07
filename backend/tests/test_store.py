@@ -83,6 +83,15 @@ def test_batch_write_retries_unprocessed_items_and_encodes_decimals():
     assert {"N": "3.00"} in [item["kp"] for item in stored]
 
 
+def test_batch_write_encodes_a_list_of_evidence_strings():
+    dynamo = FakeDynamo()
+    DynamoWriter(dynamo, "CauseScores").put_all(
+        [{"anomalyId": "gap-0001", "causeId": "radiation", "evidence": ["SEP covers the gap."]}]
+    )
+    stored = dynamo.written[0]["PutRequest"]["Item"]
+    assert stored["evidence"] == {"L": [{"S": "SEP covers the gap."}]}
+
+
 def test_unprocessed_items_that_never_clear_raise():
     class Stuck(FakeDynamo):
         def batch_write_item(self, RequestItems):

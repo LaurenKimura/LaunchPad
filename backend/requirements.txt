@@ -1,1 +1,3 @@
-# The Lambda runtime provides boto3. This package has no third-party dependencies.
+# The Lambda runtime provides boto3. The fetch, presign, and parser functions
+# have no third-party dependencies. The correlation function bundles sgp4==2.23
+# when the CDK app builds its asset. Tests install it from requirements-dev.txt.
