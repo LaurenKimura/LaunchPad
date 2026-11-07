@@ -1,0 +1,48 @@
+{
+  "version": "1",
+  "radiation": {
+    "sep_full_overlap": 85,
+    "proton_flux_ceiling_pfu": 100,
+    "proton_flux_points": 40,
+    "proton_storm_pfu": 10,
+    "flare_c": 15,
+    "flare_m": 30,
+    "flare_x": 45,
+    "cme_full_overlap": 25,
+    "saa_full": 40
+  },
+  "eclipse_power": {
+    "full_eclipse": 100
+  },
+  "geomagnetic": {
+    "kp_at_9": 70,
+    "gst_overlap": 50
+  },
+  "software_system": {
+    "duration_tolerance": 0.2,
+    "points_per_similar_gap": 30,
+    "similar_cap": 60,
+    "cadence_tolerance": 0.25,
+    "cadence_points": 40,
+    "minimum_gaps_for_cadence": 3,
+    "history_limit": 50
+  },
+  "propagation": {
+    "sample_seconds": 60,
+    "max_samples": 240,
+    "saa_lat_min": -50,
+    "saa_lat_max": 0,
+    "saa_lon_min": -90,
+    "saa_lon_max": 40,
+    "earth_radius_km": 6371
+  },
+  "association_hours": {
+    "sep": 36,
+    "cme": 48,
+    "gst": 24,
+    "flare": 2,
+    "kp": 3,
+    "proton": 3,
+    "query_lookback": 48
+  }
+}

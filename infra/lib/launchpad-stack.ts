@@ -1,0 +1,833 @@
+import { execFileSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import * as cdk from 'aws-cdk-lib/core';
+import * as amplify from 'aws-cdk-lib/aws-amplify';
+import * as apigateway from 'aws-cdk-lib/aws-apigateway';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
+import * as cognito from 'aws-cdk-lib/aws-cognito';
+import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as events from 'aws-cdk-lib/aws-events';
+import * as targets from 'aws-cdk-lib/aws-events-targets';
+import * as iam from 'aws-cdk-lib/aws-iam';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as logs from 'aws-cdk-lib/aws-logs';
+import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import * as sns from 'aws-cdk-lib/aws-sns';
+import { Construct } from 'constructs';
+
+/**
+ * Foundation for the LaunchPad satellite anomaly dashboard.
+ *
+ * Operators sign in with email. Telemetry files land in a private encrypted
+ * bucket. An hourly Lambda archives public space-weather and TLE responses.
+ * Operators request a presigned upload, and a parser records gap windows.
+ * A correlation Lambda scores each window. A separate Lambda asks Claude
+ * on Bedrock to explain those stored scores. Claude does not compute them.
+ */
+export class LaunchpadStack extends cdk.Stack {
+  private errorTopic?: sns.Topic;
+
+  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+    super(scope, id, props);
+
+    const operators = this.operatorUserPool();
+    const web = this.hostingApp();
+    const webOrigin = `https://main.${web.attrDefaultDomain}`;
+    const uploads = this.uploadsBucket(webOrigin);
+
+    const satellites = this.satellitesTable();
+    const uploadRecords = this.uploadsTable();
+    const anomalies = this.anomaliesTable();
+    const causeScores = this.causeScoresTable();
+    const spaceWeather = this.spaceWeatherTable();
+    const tleCache = this.tleCacheTable();
+    const explainUsage = this.explainUsageTable();
+    const rawResponses = this.rawResponsesBucket();
+    const nasaSecret = this.nasaSecret();
+    this.hourlyExternalFetch({ rawResponses, nasaSecret, satellites, spaceWeather, tleCache });
+    const uploadApi = this.telemetryUpload({
+      userPool: operators.pool,
+      uploads,
+      satellites,
+      uploadRecords,
+      anomalies,
+      causeScores,
+      spaceWeather,
+      tleCache,
+      explainUsage,
+      webOrigin,
+    });
+    this.hostingBranch(web, operators.pool.userPoolId, operators.client.userPoolClientId, uploadApi.url);
+
+    new cdk.CfnOutput(this, 'UserPoolId', {
+      value: operators.pool.userPoolId,
+      description: 'Cognito user pool. Operators sign in with their email address.',
+    });
+    new cdk.CfnOutput(this, 'UserPoolClientId', {
+      value: operators.client.userPoolClientId,
+      description: 'Public app client for the web UI. It has no client secret.',
+    });
+    new cdk.CfnOutput(this, 'UploadsBucketName', {
+      value: uploads.bucketName,
+      description: 'Private bucket for telemetry uploads.',
+    });
+    new cdk.CfnOutput(this, 'SatellitesTableName', { value: satellites.tableName });
+    new cdk.CfnOutput(this, 'UploadsTableName', { value: uploadRecords.tableName });
+    new cdk.CfnOutput(this, 'AnomaliesTableName', { value: anomalies.tableName });
+    new cdk.CfnOutput(this, 'CauseScoresTableName', { value: causeScores.tableName });
+    new cdk.CfnOutput(this, 'SpaceWeatherEventsTableName', { value: spaceWeather.tableName });
+    new cdk.CfnOutput(this, 'TleCacheTableName', { value: tleCache.tableName });
+    new cdk.CfnOutput(this, 'ExternalRawBucketName', {
+      value: rawResponses.bucketName,
+      description: 'Private bucket for raw DONKI, NOAA, and CelesTrak responses.',
+    });
+    new cdk.CfnOutput(this, 'NasaDonkiSecretArn', {
+      value: nasaSecret.secretArn,
+      description: 'Secrets Manager ARN. Replace the generated value with a NASA API key.',
+    });
+    new cdk.CfnOutput(this, 'UploadApiUrl', {
+      value: uploadApi.url,
+      description: 'API base URL. Send a Cognito ID token on /satellites, /anomalies, and /uploads.',
+    });
+    new cdk.CfnOutput(this, 'AmplifyAppId', {
+      value: web.attrAppId,
+      description: 'Amplify app. Connect the GitHub repository in the Amplify console.',
+    });
+    new cdk.CfnOutput(this, 'WebOrigin', {
+      value: webOrigin,
+      description: 'Only browser origin allowed to call the API and upload to S3.',
+    });
+  }
+
+  /**
+   * Email is the username. Operators can sign themselves up from the web app.
+   * An admin can still create a user. The web client uses SRP and stores no secret.
+   */
+  private operatorUserPool(): { pool: cognito.UserPool; client: cognito.UserPoolClient } {
+    const pool = new cognito.UserPool(this, 'Operators', {
+      selfSignUpEnabled: true,
+      signInAliases: { email: true },
+      autoVerify: { email: true },
+      // Email is the username, so Cognito already requires it. Marking email
+      // required in the schema as well makes the pool fail to create.
+      signInCaseSensitive: false,
+      accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
+      mfa: cognito.Mfa.OFF,
+      featurePlan: cognito.FeaturePlan.LITE,
+      passwordPolicy: {
+        minLength: 12,
+        requireLowercase: true,
+        requireUppercase: true,
+        requireDigits: true,
+        requireSymbols: true,
+        tempPasswordValidity: cdk.Duration.days(7),
+      },
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    const client = pool.addClient('WebClient', {
+      generateSecret: false,
+      disableOAuth: true,
+      preventUserExistenceErrors: true,
+      authFlows: { userSrp: true },
+      accessTokenValidity: cdk.Duration.hours(1),
+      idTokenValidity: cdk.Duration.hours(1),
+      refreshTokenValidity: cdk.Duration.days(30),
+    });
+
+    return { pool, client };
+  }
+
+  /**
+   * Telemetry files only. Public access is blocked, TLS is required, and
+   * objects are encrypted with an S3-managed key. Versioning keeps a previous
+   * copy if an upload is overwritten. Object-created events are published so
+   * the parser can run. The bucket is retained on stack delete.
+   */
+  private uploadsBucket(origin: string): s3.Bucket {
+    return new s3.Bucket(this, 'UploadsBucket', {
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      enforceSSL: true,
+      versioned: true,
+      eventBridgeEnabled: true,
+      objectOwnership: s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
+      cors: [
+        {
+          allowedMethods: [s3.HttpMethods.POST, s3.HttpMethods.PUT, s3.HttpMethods.HEAD],
+          allowedOrigins: [origin],
+          allowedHeaders: ['*'],
+          exposedHeaders: ['ETag'],
+          maxAge: 3000,
+        },
+      ],
+      lifecycleRules: [
+        {
+          abortIncompleteMultipartUploadAfter: cdk.Duration.days(7),
+        },
+      ],
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+  }
+
+  /**
+   * One item per satellite.
+   *
+   * GetItem on satelliteId opens a satellite.
+   * Query GSI byOwner (ownerSub, satelliteId) lists the signed-in operator's
+   * satellites. ownerSub is the Cognito sub, not the email.
+   */
+  private satellitesTable(): dynamodb.Table {
+    const table = diagnosticTable(this, 'Satellites', 'satelliteId');
+    table.addGlobalSecondaryIndex({
+      indexName: 'byOwner',
+      partitionKey: stringAttr('ownerSub'),
+      sortKey: stringAttr('satelliteId'),
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+    return table;
+  }
+
+  /**
+   * One item per uploaded file.
+   *
+   * Sort key uploadedAtUploadId is `{ISO-8601 UTC}#{uploadId}`.
+   * Query satelliteId for that satellite's uploads, newest first.
+   * Query GSI byUploadId when the page or the processor has only the upload id.
+   * Query GSI byOwner (ownerSub, uploadedAtUploadId) for the operator's uploads.
+   */
+  private uploadsTable(): dynamodb.Table {
+    const table = diagnosticTable(this, 'Uploads', 'satelliteId', 'uploadedAtUploadId');
+    table.addGlobalSecondaryIndex({
+      indexName: 'byUploadId',
+      partitionKey: stringAttr('uploadId'),
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+    table.addGlobalSecondaryIndex({
+      indexName: 'byOwner',
+      partitionKey: stringAttr('ownerSub'),
+      sortKey: stringAttr('uploadedAtUploadId'),
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+    return table;
+  }
+
+  /**
+   * One gap or error row from a file.
+   *
+   * Sort key startTimeAnomalyId is `{ISO-8601 start}#{anomalyId}`.
+   * Query uploadId for the timeline, in time order.
+   * Query GSI byAnomalyId to open one anomaly.
+   * Query GSI bySatellite (satelliteId, startTimeAnomalyId) for recent gaps
+   * when the software score looks for a repeating pattern.
+   */
+  private anomaliesTable(): dynamodb.Table {
+    const table = diagnosticTable(this, 'Anomalies', 'uploadId', 'startTimeAnomalyId');
+    table.addGlobalSecondaryIndex({
+      indexName: 'byAnomalyId',
+      partitionKey: stringAttr('anomalyId'),
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+    table.addGlobalSecondaryIndex({
+      indexName: 'bySatellite',
+      partitionKey: stringAttr('satelliteId'),
+      sortKey: stringAttr('startTimeAnomalyId'),
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+    return table;
+  }
+
+  /**
+   * One item per cause. A score is 0-100 and stands on its own; rows are never
+   * resized so the set sums to 100.
+   *
+   * Query anomalyId to read every cause for one gap. Sort key causeId is one of
+   * radiation, eclipse_power, geomagnetic, or software_system, so one anomaly
+   * has at most one row per cause.
+   * Query GSI byUpload (uploadId, anomalyIdCauseId) to load every score for
+   * an upload. anomalyIdCauseId is `{anomalyId}#{causeId}`.
+   */
+  private causeScoresTable(): dynamodb.Table {
+    const table = diagnosticTable(this, 'CauseScores', 'anomalyId', 'causeId');
+    table.addGlobalSecondaryIndex({
+      indexName: 'byUpload',
+      partitionKey: stringAttr('uploadId'),
+      sortKey: stringAttr('anomalyIdCauseId'),
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+    return table;
+  }
+
+  /**
+   * Cached public space-weather samples, partitioned by dataset
+   * (for example kp, dst, proton_10mev).
+   *
+   * Query dataset plus an observedAt range for the samples that overlap a gap.
+   * Query dataset and observedAt <= gap time, newest first, limit 1, for the
+   * sample in effect.
+   *
+   * NOAA rows store a plain ISO-8601 UTC timestamp. DONKI rows store
+   * `{timestamp}#{eventId}` so two events at the same second both remain.
+   * A range end of `{end}~` includes those ids, because `~` sorts after `#`.
+   */
+  private spaceWeatherTable(): dynamodb.Table {
+    return diagnosticTable(this, 'SpaceWeatherEvents', 'dataset', 'observedAt');
+  }
+
+  /**
+   * Cached two-line element sets for one satellite.
+   *
+   * Query satelliteId, epoch descending, limit 1, for the newest cache entry.
+   * Query satelliteId and epoch <= a gap time, descending, limit 1, for the
+   * elements to propagate. epoch is the TLE epoch in ISO-8601 UTC.
+   * One item per satellite per epoch; a repeat fetch overwrites that epoch.
+   */
+  private tleCacheTable(): dynamodb.Table {
+    return diagnosticTable(this, 'TleCache', 'satelliteId', 'epoch');
+  }
+
+  /**
+   * One counter per operator per UTC day. The explain Lambda adds a call
+   * only while the count is under the daily limit. Items expire on their own.
+   */
+  private explainUsageTable(): dynamodb.Table {
+    return new dynamodb.Table(this, 'ExplainUsage', {
+      partitionKey: stringAttr('ownerSub'),
+      sortKey: stringAttr('day'),
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      encryption: dynamodb.TableEncryption.AWS_MANAGED,
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+      timeToLiveAttribute: 'expiresAt',
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+  }
+
+  /**
+   * Raw public API bodies. Separate from the telemetry bucket so this data
+   * and operator uploads are not mixed, and so the fetch role never receives
+   * permission to read uploads. `raw/` expires after 30 days. `cache/` stays.
+   */
+  private rawResponsesBucket(): s3.Bucket {
+    return new s3.Bucket(this, 'ExternalRawBucket', {
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      enforceSSL: true,
+      versioned: true,
+      objectOwnership: s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
+      lifecycleRules: [
+        {
+          prefix: 'raw/',
+          expiration: cdk.Duration.days(30),
+        },
+        {
+          abortIncompleteMultipartUploadAfter: cdk.Duration.days(7),
+        },
+      ],
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+  }
+
+  /**
+   * The value is generated on first create. Put the real NASA key in with
+   * `put-secret-value` after deploy. Later deploys do not rotate it.
+   */
+  private nasaSecret(): secretsmanager.Secret {
+    return new secretsmanager.Secret(this, 'NasaDonkiApiKey', {
+      description: 'NASA API key for the hourly DONKI fetch. Replace the generated value after the first deploy.',
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+  }
+
+  /**
+   * Hourly fetch. The role can read the NASA secret, scan Satellites for
+   * catalog numbers, and write space-weather and TLE rows. It can get and put
+   * objects under raw/ and cache/ in the external bucket only.
+   */
+  private hourlyExternalFetch(resources: {
+    rawResponses: s3.Bucket;
+    nasaSecret: secretsmanager.Secret;
+    satellites: dynamodb.Table;
+    spaceWeather: dynamodb.Table;
+    tleCache: dynamodb.Table;
+  }): void {
+    const backendSrc = path.resolve(__dirname, '../../backend/src');
+    const fetchFn = new lambda.Function(this, 'ExternalFetch', {
+      description: 'Hourly fetch of DONKI, NOAA SWPC, and CelesTrak into S3 and DynamoDB.',
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'handler.handler',
+      code: lambda.Code.fromAsset(backendSrc, {
+        exclude: ['**/__pycache__/**', '**/*.pyc'],
+      }),
+      timeout: cdk.Duration.minutes(5),
+      memorySize: 256,
+      logGroup: new logs.LogGroup(this, 'ExternalFetchLogs', {
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+      environment: {
+        RAW_BUCKET_NAME: resources.rawResponses.bucketName,
+        SPACE_WEATHER_TABLE_NAME: resources.spaceWeather.tableName,
+        TLE_TABLE_NAME: resources.tleCache.tableName,
+        SATELLITES_TABLE_NAME: resources.satellites.tableName,
+        NASA_SECRET_ARN: resources.nasaSecret.secretArn,
+        DONKI_LOOKBACK_DAYS: '7',
+      },
+    });
+    this.watchErrors(fetchFn, 'ExternalFetch');
+
+    fetchFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadWriteExternalRaw',
+      actions: ['s3:GetObject', 's3:PutObject'],
+      resources: [
+        resources.rawResponses.arnForObjects('raw/*'),
+        resources.rawResponses.arnForObjects('cache/*'),
+      ],
+    }));
+    fetchFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'WriteSpaceWeatherAndTle',
+      actions: ['dynamodb:PutItem', 'dynamodb:BatchWriteItem'],
+      resources: [resources.spaceWeather.tableArn, resources.tleCache.tableArn],
+    }));
+    fetchFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ListTrackedSatellites',
+      actions: ['dynamodb:Scan'],
+      resources: [resources.satellites.tableArn],
+    }));
+    resources.nasaSecret.grantRead(fetchFn);
+
+    new events.Rule(this, 'HourlyExternalFetch', {
+      description: 'Fetch space weather and TLEs every hour.',
+      schedule: events.Schedule.rate(cdk.Duration.hours(1)),
+      targets: [new targets.LambdaFunction(fetchFn)],
+    });
+  }
+
+  /**
+   * Presigned POST for one telemetry file, then a parser on the S3 event.
+   * The presign role can write the pending upload row and sign PutObject.
+   * The parser role can read that object and write anomaly windows.
+   * Neither role can delete objects or read the external-data bucket.
+   */
+  private telemetryUpload(resources: {
+    userPool: cognito.UserPool;
+    uploads: s3.Bucket;
+    satellites: dynamodb.Table;
+    uploadRecords: dynamodb.Table;
+    anomalies: dynamodb.Table;
+    causeScores: dynamodb.Table;
+    spaceWeather: dynamodb.Table;
+    tleCache: dynamodb.Table;
+    explainUsage: dynamodb.Table;
+    webOrigin: string;
+  }): apigateway.RestApi {
+    const backendSrc = path.resolve(__dirname, '../../backend/src');
+    const code = lambda.Code.fromAsset(backendSrc, {
+      exclude: ['**/__pycache__/**', '**/*.pyc'],
+    });
+    const presignFn = new lambda.Function(this, 'PresignUpload', {
+      description: 'Returns a presigned POST for one telemetry file.',
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'presign.handler',
+      code,
+      timeout: cdk.Duration.seconds(10),
+      memorySize: 256,
+      logGroup: new logs.LogGroup(this, 'PresignUploadLogs', {
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+      environment: {
+        UPLOADS_BUCKET_NAME: resources.uploads.bucketName,
+        UPLOADS_TABLE_NAME: resources.uploadRecords.tableName,
+        SATELLITES_TABLE_NAME: resources.satellites.tableName,
+        MAX_UPLOAD_BYTES: '5242880',
+        PRESIGN_EXPIRES_SECONDS: '900',
+      },
+    });
+    this.watchErrors(presignFn, 'PresignUpload');
+    const scoredCode = correlateAsset();
+    const correlateFn = new lambda.Function(this, 'CorrelateGaps', {
+      description: 'Scores each anomaly window from TLE propagation and space weather.',
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'correlate.handler',
+      code: scoredCode,
+      timeout: cdk.Duration.seconds(120),
+      memorySize: 512,
+      logGroup: new logs.LogGroup(this, 'CorrelateGapsLogs', {
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+      environment: {
+        ANOMALIES_TABLE_NAME: resources.anomalies.tableName,
+        CAUSE_SCORES_TABLE_NAME: resources.causeScores.tableName,
+        SPACE_WEATHER_TABLE_NAME: resources.spaceWeather.tableName,
+        TLE_TABLE_NAME: resources.tleCache.tableName,
+      },
+    });
+    this.watchErrors(correlateFn, 'CorrelateGaps');
+    const parserFn = new lambda.Function(this, 'ParseUpload', {
+      description: 'Validates an uploaded telemetry file and records gap windows.',
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'parse_upload.handler',
+      code,
+      timeout: cdk.Duration.seconds(60),
+      memorySize: 512,
+      logGroup: new logs.LogGroup(this, 'ParseUploadLogs', {
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+      environment: {
+        UPLOADS_BUCKET_NAME: resources.uploads.bucketName,
+        UPLOADS_TABLE_NAME: resources.uploadRecords.tableName,
+        ANOMALIES_TABLE_NAME: resources.anomalies.tableName,
+        MAX_UPLOAD_BYTES: '5242880',
+        MAX_UPLOAD_ROWS: '100000',
+        GAP_INTERVAL_MULTIPLIER: '2',
+        CORRELATE_FUNCTION_NAME: correlateFn.functionName,
+      },
+    });
+    this.watchErrors(parserFn, 'ParseUpload');
+
+    presignFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'SignTelemetryUpload',
+      actions: ['s3:PutObject'],
+      resources: [resources.uploads.arnForObjects('uploads/*')],
+    }));
+    presignFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadSatelliteOwner',
+      actions: ['dynamodb:GetItem'],
+      resources: [resources.satellites.tableArn],
+    }));
+    presignFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'CreatePendingUpload',
+      actions: ['dynamodb:PutItem'],
+      resources: [resources.uploadRecords.tableArn],
+    }));
+
+    parserFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadTelemetryUpload',
+      actions: ['s3:GetObject'],
+      resources: [resources.uploads.arnForObjects('uploads/*')],
+    }));
+    parserFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'UpdateUploadStatus',
+      actions: ['dynamodb:GetItem', 'dynamodb:UpdateItem'],
+      resources: [resources.uploadRecords.tableArn],
+    }));
+    parserFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'WriteAnomalyWindows',
+      actions: ['dynamodb:PutItem', 'dynamodb:BatchWriteItem'],
+      resources: [resources.anomalies.tableArn],
+    }));
+    correlateFn.grantInvoke(parserFn);
+    correlateFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadAnomalyWindows',
+      actions: ['dynamodb:Query'],
+      resources: [resources.anomalies.tableArn, `${resources.anomalies.tableArn}/index/bySatellite`],
+    }));
+    correlateFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadSpaceWeatherAndTle',
+      actions: ['dynamodb:Query'],
+      resources: [resources.spaceWeather.tableArn, resources.tleCache.tableArn],
+    }));
+    correlateFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'WriteCauseScores',
+      actions: ['dynamodb:PutItem', 'dynamodb:BatchWriteItem'],
+      resources: [resources.causeScores.tableArn],
+    }));
+
+    const readFn = new lambda.Function(this, 'ReadApi', {
+      description: 'Lists the caller\'s satellites and anomalies, and returns one anomaly with scores, timeline, and space weather.',
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'read_api.handler',
+      code: scoredCode,
+      timeout: cdk.Duration.seconds(20),
+      memorySize: 512,
+      logGroup: new logs.LogGroup(this, 'ReadApiLogs', {
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+      environment: {
+        SATELLITES_TABLE_NAME: resources.satellites.tableName,
+        ANOMALIES_TABLE_NAME: resources.anomalies.tableName,
+        CAUSE_SCORES_TABLE_NAME: resources.causeScores.tableName,
+        SPACE_WEATHER_TABLE_NAME: resources.spaceWeather.tableName,
+        TLE_TABLE_NAME: resources.tleCache.tableName,
+      },
+    });
+    this.watchErrors(readFn, 'ReadApi');
+    readFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ListOwnedSatellites',
+      actions: ['dynamodb:Query', 'dynamodb:GetItem'],
+      resources: [resources.satellites.tableArn, `${resources.satellites.tableArn}/index/byOwner`],
+    }));
+    readFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadAnomalies',
+      actions: ['dynamodb:Query'],
+      resources: [
+        `${resources.anomalies.tableArn}/index/bySatellite`,
+        `${resources.anomalies.tableArn}/index/byAnomalyId`,
+      ],
+    }));
+    readFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadCauseScores',
+      actions: ['dynamodb:Query'],
+      resources: [resources.causeScores.tableArn],
+    }));
+    readFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadSpaceWeatherAndTle',
+      actions: ['dynamodb:Query'],
+      resources: [resources.spaceWeather.tableArn, resources.tleCache.tableArn],
+    }));
+
+    const api = new apigateway.RestApi(this, 'UploadApi', {
+      restApiName: 'launchpad-uploads',
+      description: 'Operator API for satellites, anomalies, and presigned uploads.',
+      defaultCorsPreflightOptions: {
+        allowOrigins: [resources.webOrigin],
+        allowMethods: ['GET', 'POST', 'OPTIONS'],
+        allowHeaders: ['Authorization', 'Content-Type'],
+      },
+      deployOptions: {
+        throttlingRateLimit: 10,
+        throttlingBurstLimit: 20,
+      },
+    });
+    const authorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'OperatorsAuthorizer', {
+      cognitoUserPools: [resources.userPool],
+    });
+    const authorized = {
+      authorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    };
+    const modelId = 'anthropic.claude-3-5-sonnet-20241022-v2:0';
+    const explainFn = new lambda.Function(this, 'ExplainAnomaly', {
+      description: 'Asks Claude to explain stored anomaly scores. It does not compute scores.',
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'explain.handler',
+      code: scoredCode,
+      timeout: cdk.Duration.seconds(30),
+      memorySize: 512,
+      logGroup: new logs.LogGroup(this, 'ExplainAnomalyLogs', {
+        retention: logs.RetentionDays.ONE_WEEK,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      }),
+      environment: {
+        SATELLITES_TABLE_NAME: resources.satellites.tableName,
+        ANOMALIES_TABLE_NAME: resources.anomalies.tableName,
+        CAUSE_SCORES_TABLE_NAME: resources.causeScores.tableName,
+        SPACE_WEATHER_TABLE_NAME: resources.spaceWeather.tableName,
+        TLE_TABLE_NAME: resources.tleCache.tableName,
+        USAGE_TABLE_NAME: resources.explainUsage.tableName,
+        BEDROCK_MODEL_ID: modelId,
+        BEDROCK_DAILY_LIMIT: '20',
+      },
+    });
+    this.watchErrors(explainFn, 'ExplainAnomaly');
+    explainFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadOwnedAnomaly',
+      actions: ['dynamodb:GetItem'],
+      resources: [resources.satellites.tableArn],
+    }));
+    explainFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ReadAnomalyContext',
+      actions: ['dynamodb:Query'],
+      resources: [
+        `${resources.anomalies.tableArn}/index/byAnomalyId`,
+        resources.causeScores.tableArn,
+        resources.spaceWeather.tableArn,
+        resources.tleCache.tableArn,
+      ],
+    }));
+    explainFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'CountDailyExplanations',
+      actions: ['dynamodb:UpdateItem'],
+      resources: [resources.explainUsage.tableArn],
+    }));
+    explainFn.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'InvokeClaude',
+      actions: ['bedrock:InvokeModel'],
+      resources: [`arn:aws:bedrock:${this.region}::foundation-model/${modelId}`],
+    }));
+
+    const readIntegration = new apigateway.LambdaIntegration(readFn, { proxy: true });
+    api.root.addResource('satellites').addMethod('GET', readIntegration, authorized);
+    const anomalies = api.root.addResource('anomalies');
+    anomalies.addMethod('GET', readIntegration, authorized);
+    const anomaly = anomalies.addResource('{anomalyId}');
+    anomaly.addMethod('GET', readIntegration, authorized);
+    anomaly.addResource('explain').addMethod(
+      'POST',
+      new apigateway.LambdaIntegration(explainFn, { proxy: true }),
+      authorized,
+    );
+    api.root.addResource('uploads').addMethod(
+      'POST',
+      new apigateway.LambdaIntegration(presignFn, { proxy: true }),
+      authorized,
+    );
+
+    new events.Rule(this, 'TelemetryUploadCreated', {
+      description: 'Parse a telemetry file after it is created in the uploads bucket.',
+      eventPattern: {
+        source: ['aws.s3'],
+        detailType: ['Object Created'],
+        detail: {
+          bucket: { name: [resources.uploads.bucketName] },
+          object: { key: [{ prefix: 'uploads/' }] },
+        },
+      },
+      targets: [new targets.LambdaFunction(parserFn, { retryAttempts: 2 })],
+    });
+    return api;
+  }
+
+  /**
+   * Static hosting for the web app. The Git repository is connected in the
+   * Amplify console so this stack does not store a GitHub token. API CORS and
+   * the uploads bucket allow only https://main.<default domain>.
+   */
+  private hostingApp(): amplify.CfnApp {
+    const role = new iam.Role(this, 'AmplifyServiceRole', {
+      assumedBy: new iam.ServicePrincipal('amplify.amazonaws.com'),
+      description: 'Lets Amplify Hosting write its build logs.',
+    });
+    role.addToPolicy(new iam.PolicyStatement({
+      sid: 'WriteAmplifyBuildLogs',
+      actions: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents'],
+      resources: [`arn:aws:logs:${this.region}:${this.account}:log-group:/aws/amplify/*`],
+    }));
+    return new amplify.CfnApp(this, 'WebApp', {
+      name: 'launchpad',
+      platform: 'WEB',
+      iamServiceRole: role.roleArn,
+      description: 'LaunchPad operator dashboard.',
+      buildSpec: [
+        'version: 1',
+        'frontend:',
+        '  phases:',
+        '    preBuild:',
+        '      commands:',
+        '        - npm ci --prefix frontend',
+        '    build:',
+        '      commands:',
+        '        - npm run build --prefix frontend',
+        '  artifacts:',
+        '    baseDirectory: frontend/dist',
+        '    files:',
+        "      - '**/*'",
+        '  cache:',
+        '    paths:',
+        '      - frontend/node_modules/**/*',
+      ].join('\n'),
+      customRules: [
+        {
+          source: '</^[^.]+$|\\.(?!(css|gif|ico|jpg|js|png|txt|svg|woff|woff2|ttf|map|json|webp)$)([^.]+$)/>',
+          target: '/index.html',
+          status: '200',
+        },
+      ],
+    });
+  }
+
+  private hostingBranch(app: amplify.CfnApp, userPoolId: string, clientId: string, apiUrl: string): void {
+    new amplify.CfnBranch(this, 'WebBranch', {
+      appId: app.attrAppId,
+      branchName: 'main',
+      stage: 'PRODUCTION',
+      framework: 'React',
+      enableAutoBuild: true,
+      environmentVariables: [
+        { name: 'VITE_USER_POOL_ID', value: userPoolId },
+        { name: 'VITE_USER_POOL_CLIENT_ID', value: clientId },
+        { name: 'VITE_API_URL', value: apiUrl },
+      ],
+    });
+  }
+
+  /** One alarm per function. Missing data is not an error. The topic has no subscription until an operator adds one. */
+  private watchErrors(fn: lambda.Function, id: string): void {
+    if (!this.errorTopic) {
+      this.errorTopic = new sns.Topic(this, 'LambdaErrorTopic', {
+        displayName: 'LaunchPad Lambda errors',
+      });
+      new cdk.CfnOutput(this, 'LambdaErrorTopicArn', {
+        value: this.errorTopic.topicArn,
+        description: 'Subscribe an email to hear about Lambda errors.',
+      });
+    }
+    const alarm = new cloudwatch.Alarm(this, `${id}Errors`, {
+      alarmDescription: `${id} reported at least one error in five minutes.`,
+      metric: fn.metricErrors({ period: cdk.Duration.minutes(5), statistic: 'Sum' }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+    alarm.addAlarmAction(new cloudwatchActions.SnsAction(this.errorTopic));
+  }
+}
+
+/**
+ * The correlate function needs sgp4, which the Lambda runtime does not ship.
+ * Local bundling installs that one package and copies the Python sources on
+ * top, so synth does not need Docker.
+ */
+function correlateAsset(): lambda.Code {
+  const backendSrc = path.resolve(__dirname, '../../backend/src');
+  return lambda.Code.fromAsset(backendSrc, {
+    exclude: ['**/__pycache__/**', '**/*.pyc'],
+    bundling: {
+      image: lambda.Runtime.PYTHON_3_12.bundlingImage,
+      command: [
+        'bash',
+        '-c',
+        'python3 -m pip install --no-cache-dir sgp4==2.23 -t /asset-output && cp -au /asset-input/. /asset-output',
+      ],
+      local: {
+        tryBundle(outputDir: string): boolean {
+          execFileSync('python3', ['-m', 'pip', 'install', '--no-cache-dir', 'sgp4==2.23', '-t', outputDir], {
+            stdio: 'inherit',
+          });
+          for (const entry of fs.readdirSync(backendSrc)) {
+            if (entry === '__pycache__' || entry.endsWith('.pyc')) {
+              continue;
+            }
+            fs.cpSync(path.join(backendSrc, entry), path.join(outputDir, entry), {
+              recursive: true,
+              filter: (source) => !source.includes('__pycache__') && !source.endsWith('.pyc'),
+            });
+          }
+          return true;
+        },
+      },
+    },
+  });
+}
+
+function stringAttr(name: string): dynamodb.Attribute {
+  return { name, type: dynamodb.AttributeType.STRING };
+}
+
+/** On-demand table, encrypted with the DynamoDB-owned key, kept on stack delete. */
+function diagnosticTable(
+  scope: Construct,
+  id: string,
+  partitionKey: string,
+  sortKey?: string,
+): dynamodb.Table {
+  return new dynamodb.Table(scope, id, {
+    partitionKey: stringAttr(partitionKey),
+    sortKey: sortKey === undefined ? undefined : stringAttr(sortKey),
+    billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+    encryption: dynamodb.TableEncryption.AWS_MANAGED,
+    pointInTimeRecoverySpecification: {
+      pointInTimeRecoveryEnabled: true,
+    },
+    removalPolicy: cdk.RemovalPolicy.RETAIN,
+  });
+}
